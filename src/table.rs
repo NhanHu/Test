@@ -54,9 +54,16 @@ pub fn zeroed_bytes(bytes: usize) -> *mut u8 {
         let p = mmap(std::ptr::null_mut(), len + HUGE, 3, 0x2 | 0x20 | 0x4000, -1, 0);
         assert!(p as isize != -1, "mmap failed");
         let aligned = ((p as usize + HUGE - 1) & !(HUGE - 1)) as *mut u8;
-        madvise(aligned, len, 14); // MADV_HUGEPAGE
+        if huge_pages() {
+            madvise(aligned, len, 14); // MADV_HUGEPAGE
+        }
         aligned
     }
+}
+
+fn huge_pages() -> bool {
+    static H: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *H.get_or_init(|| std::env::var_os("NOHUGE").is_none())
 }
 
 fn zeroed<T>(n: usize) -> *mut T {

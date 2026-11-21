@@ -1,5 +1,6 @@
 //! Shopping Sessions pipeline. Reads $DATA_DIR, writes $OUTPUT_DIR/{user_daily,campaign_daily}/*.parquet.
 
+mod alloc;
 mod csv;
 mod keys;
 mod parquet;
@@ -16,6 +17,9 @@ use std::time::Instant;
 use keys::{key_cmp, key_lookup_padded, key_of, key_of_padded, mix};
 use table::{IdAlloc, UserTable};
 use ts::{parse_ts, TsParser, DAY};
+
+#[global_allocator]
+static GLOBAL: alloc::HugeAlloc = alloc::HugeAlloc;
 
 const GAP: u32 = 1_800_000;
 const WEEK: u32 = 604_800_000;
@@ -362,6 +366,8 @@ struct PartBuf<'p, T: Copy> {
     cur: Vec<*mut T>,
     fill: Vec<u32>,
     blocks: Vec<Vec<*mut T>>,
+    /// recycled blocks to use before asking the pool
+    spare: Vec<*mut u8>,
 }
 
 unsafe impl<T: Copy + Send> Send for PartBuf<'_, T> {}
@@ -376,6 +382,7 @@ impl<'p, T: Copy> PartBuf<'p, T> {
             cur: vec![std::ptr::null_mut(); n_parts],
             fill: vec![per_block; n_parts],
             blocks: (0..n_parts).map(|_| Vec::new()).collect(),
+            spare: Vec::new(),
         }
     }
     #[inline(always)]
@@ -393,7 +400,10 @@ impl<'p, T: Copy> PartBuf<'p, T> {
     #[cold]
     #[inline(never)]
     fn new_block(&mut self, p: usize) {
-        let b = self.pool.alloc(BLOCK_BYTES) as *mut T;
+        let b = match self.spare.pop() {
+            Some(b) => b as *mut T,
+            None => self.pool.alloc(BLOCK_BYTES) as *mut T,
+        };
         self.blocks[p].push(b);
         self.cur[p] = b;
         self.fill[p] = 0;
@@ -407,6 +417,10 @@ impl<'p, T: Copy> PartBuf<'p, T> {
             .iter()
             .enumerate()
             .map(move |(i, &b)| unsafe { std::slice::from_raw_parts(b as *const T, if i + 1 == nb { last } else { per }) })
+    }
+    /// The raw blocks of partition p (for recycling once their records are consumed).
+    fn block_ptrs(&self, p: usize) -> impl Iterator<Item = *mut u8> + '_ {
+        self.blocks[p].iter().map(|&b| b as *mut u8)
     }
     fn len(&self, p: usize) -> usize {
         let nb = self.blocks[p].len();
@@ -1127,9 +1141,8 @@ fn run<R: ERec>(ctx: &Ctx, data: &Path, out: &Path, nt: usize, t0: Instant) {
     const CLICK_ITEM: usize = 1 << 20;
     let n_clicks: usize = t1.iter().map(|o| o.clicks.len()).sum();
     let n_events: usize = t1.iter().map(|o| (0..np_parts).map(|p| o.ev.len(p)).sum::<usize>()).sum();
-    let pool2 = Pool::new(
-        n_events * std::mem::size_of::<PRec>() + n_clicks * std::mem::size_of::<PClick>() + 2 * nt * nq * BLOCK_BYTES,
-    );
+    let _ = n_events;
+    let pool2 = Pool::new(n_clicks * std::mem::size_of::<PClick>() + 2 * nt * nq * BLOCK_BYTES);
     let mut items2: Vec<(usize, usize)> = (0..np_parts).map(|p| (usize::MAX, p)).collect();
     for (t, o) in t1.iter().enumerate() {
         for s in (0..o.clicks.len()).step_by(CLICK_ITEM) {
@@ -1157,6 +1170,10 @@ fn run<R: ERec>(ctx: &Ctx, data: &Path, out: &Path, nt: usize, t0: Instant) {
                                 for c in o1.ev.chunks(x) {
                                     recs.extend_from_slice(c);
                                 }
+                            }
+                            // partition x is consumed: its blocks back this thread's output
+                            for o1 in &t1 {
+                                o.ev.spare.extend(o1.ev.block_ptrs(x));
                             }
                             let n = recs.len();
                             let cap = (n * 2).next_power_of_two().max(16);
@@ -1196,6 +1213,13 @@ fn run<R: ERec>(ctx: &Ctx, data: &Path, out: &Path, nt: usize, t0: Instant) {
                                 o.ev.push(q, PRec { k: (local << 32) | r.ts() as u64, price: r.price(), cat: r.cat() });
                             }
                         } else {
+                            let need = (CLICK_ITEM * std::mem::size_of::<PClick>()).div_ceil(BLOCK_BYTES) + nq;
+                            while o.cl.spare.len() < need {
+                                match o.ev.spare.pop() {
+                                    Some(b) => o.cl.spare.push(b),
+                                    None => break,
+                                }
+                            }
                             let cl = &t1[t].clicks;
                             for c in &cl[x..(x + CLICK_ITEM).min(cl.len())] {
                                 let d = c.user;
