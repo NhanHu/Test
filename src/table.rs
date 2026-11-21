@@ -18,7 +18,7 @@ struct Slot {
 pub struct UserTable {
     slots: *mut Slot,
     n_slots: usize,
-    shift: u32,
+    bits: u32,
     names: *mut u64,
     max_ids: usize,
     next_block: AtomicU32,
@@ -78,7 +78,7 @@ impl UserTable {
         UserTable {
             slots: zeroed::<Slot>(n_slots),
             n_slots,
-            shift: 64 - n_slots.trailing_zeros(),
+            bits: n_slots.trailing_zeros(),
             names: zeroed::<u64>(max_ids),
             max_ids,
             next_block: AtomicU32::new(0),
@@ -89,7 +89,7 @@ impl UserTable {
 
     #[inline(always)]
     pub fn hash(&self, key: u64) -> usize {
-        fib(key, 64 - self.shift)
+        fib(key, self.bits)
     }
 
     #[inline(always)]

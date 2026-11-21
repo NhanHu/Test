@@ -403,11 +403,11 @@ impl<'p, T: Copy> PartBuf<'p, T> {
     #[inline(always)]
     fn push(&mut self, p: usize, x: T) {
         unsafe {
-            let h = self.heads.get_unchecked_mut(p);
+            let mut h = self.heads.get_unchecked_mut(p);
             if h.fill == self.per_block {
                 self.new_block(p);
+                h = self.heads.get_unchecked_mut(p);
             }
-            let h = self.heads.get_unchecked_mut(p);
             h.cur.add(h.fill as usize).write(x);
             h.fill += 1;
         }
@@ -471,7 +471,12 @@ impl InFile {
     fn open(path: &Path, kind: Kind) -> InFile {
         let file = File::open(path).expect("open");
         let size = file.metadata().map(|m| m.len()).unwrap_or(0) as usize;
-        if size == 0 {
+        let min_header = match kind {
+            Kind::Events => 65,
+            Kind::Clicks => 31,
+            Kind::Links => 18,
+        };
+        if size <= min_header {
             return InFile { ptr: std::ptr::null(), size: 0, kind };
         }
         let page = 4096usize;
@@ -517,18 +522,17 @@ struct T1Out<'p, R: Copy> {
     ev: PartBuf<'p, R>,
     clicks: Vec<CRec>,
     links: Vec<(u32, u32)>,
-    lines: [u64; 3],
 }
 
 #[derive(Clone, Copy)]
 struct UserCache {
-    keys: [u64; 512],
-    ids: [u32; 512],
+    keys: [u64; 1024],
+    ids: [u32; 1024],
 }
 
 impl UserCache {
     fn new() -> Self {
-        UserCache { keys: [0; 512], ids: [0; 512] }
+        UserCache { keys: [0; 1024], ids: [0; 1024] }
     }
 }
 
@@ -560,7 +564,7 @@ struct Parser<'a> {
     table: &'a UserTable,
     alloc: IdAlloc,
     cache: UserCache,
-    pshift: u32,
+    pbits: u32,
     tsp: TsParser,
     evb: [PendEv; BATCH],
     nev: usize,
@@ -604,25 +608,38 @@ impl<'a> Parser<'a> {
         }
         if valid {
             let et = fld(4);
-            if et.len() == 8 && et == b"purchase" {
-                let p = fld(6);
-                let mut v: u64 = 0;
-                let mut ok = !p.is_empty();
-                for &c in p {
-                    let d = c.wrapping_sub(b'0');
-                    if d > 9 {
-                        ok = false;
-                        break;
-                    }
-                    v = (v * 10 + d as u64).min(100_000_000);
+            if et.len() == 4 {
+                let w = unsafe { std::ptr::read_unaligned(et.as_ptr() as *const u32) };
+                const VIEW: u32 = u32::from_ne_bytes(*b"view");
+                const CART: u32 = u32::from_ne_bytes(*b"cart");
+                if w != VIEW && w != CART {
+                    valid = false;
                 }
-                if ok && (1..=10_000_000).contains(&v) {
-                    price = v as u32;
-                    cat = ctx.product_cat(prod);
+            } else if et.len() == 8 {
+                const PURCHASE: u64 = u64::from_ne_bytes(*b"purchase");
+                let w = unsafe { std::ptr::read_unaligned(et.as_ptr() as *const u64) };
+                if w == PURCHASE {
+                    let p = fld(6);
+                    let mut v: u64 = 0;
+                    let mut ok = !p.is_empty();
+                    for &c in p {
+                        let d = c.wrapping_sub(b'0');
+                        if d > 9 {
+                            ok = false;
+                            break;
+                        }
+                        v = (v * 10 + d as u64).min(100_000_000);
+                    }
+                    if ok && (1..=10_000_000).contains(&v) {
+                        price = v as u32;
+                        cat = ctx.product_cat(prod);
+                    } else {
+                        valid = false;
+                    }
                 } else {
                     valid = false;
                 }
-            } else if !(et.len() == 4 && (et == b"view" || et == b"cart")) {
+            } else {
                 valid = false;
             }
         }
@@ -630,7 +647,7 @@ impl<'a> Parser<'a> {
         if valid {
             let ukey = unsafe { key_of_padded(user_s) };
             pe.ukey = ukey;
-            let idx = (ukey ^ (ukey >> 9)) as usize & 511;
+            let idx = (ukey ^ (ukey >> 10)) as usize & 1023;
             if self.cache.keys[idx] == ukey {
                 pe.user = self.cache.ids[idx];
             } else {
@@ -655,7 +672,7 @@ impl<'a> Parser<'a> {
                     pe.user
                 } else {
                     let id = self.table.get_or_insert(pe.ukey, pe.uh, &mut self.alloc);
-                    let idx = (pe.ukey ^ (pe.ukey >> 9)) as usize & 511;
+                    let idx = (pe.ukey ^ (pe.ukey >> 10)) as usize & 1023;
                     self.cache.keys[idx] = pe.ukey;
                     self.cache.ids[idx] = id;
                     id
@@ -663,7 +680,7 @@ impl<'a> Parser<'a> {
             } else {
                 INVALID
             };
-            let p = fib(pe.key, 64 - self.pshift);
+            let p = fib(pe.key, self.pbits);
             out.ev.push(p, R::make(pe.key, pe.ing, user, pe.ts, pe.price, pe.cat));
         }
         self.nev = 0;
@@ -687,7 +704,7 @@ impl<'a> Parser<'a> {
             None => return,
         };
         let ukey = unsafe { key_of_padded(user_s) };
-        let idx = (ukey ^ (ukey >> 9)) as usize & 511;
+        let idx = (ukey ^ (ukey >> 10)) as usize & 1023;
         let (user, uh) = if self.cache.keys[idx] == ukey {
             (self.cache.ids[idx], 0)
         } else {
@@ -710,7 +727,7 @@ impl<'a> Parser<'a> {
                 pc.user
             } else {
                 let id = self.table.get_or_insert(pc.ukey, pc.uh, &mut self.alloc);
-                let idx = (pc.ukey ^ (pc.ukey >> 9)) as usize & 511;
+                let idx = (pc.ukey ^ (pc.ukey >> 10)) as usize & 1023;
                 self.cache.keys[idx] = pc.ukey;
                 self.cache.ids[idx] = id;
                 id
@@ -763,7 +780,6 @@ fn process_chunk<R: ERec>(p: &mut Parser, f: &InFile, ch: &Chunk, out: &mut T1Ou
         data[ch.s..].iter().position(|&c| c == b'\n').map_or(n, |q| ch.s + q + 1)
     };
     let ptr = f.ptr;
-    let mut count = 0u64;
     while i < ch.e {
         let avail = n - i;
         macro_rules! handle {
@@ -773,7 +789,6 @@ fn process_chunk<R: ERec>(p: &mut Parser, f: &InFile, ch: &Chunk, out: &mut T1Ou
                     let line = unsafe { std::slice::from_raw_parts(ptr.add(i), len) };
                     p.$method(line, &fl, out);
                 }
-                count += 1;
                 i += len + 1;
             }};
         }
@@ -786,7 +801,6 @@ fn process_chunk<R: ERec>(p: &mut Parser, f: &InFile, ch: &Chunk, out: &mut T1Ou
     p.flush_events(out);
     p.flush_clicks(out);
     p.flush_links(out);
-    out.lines[f.kind as usize] += count;
 }
 
 // ---------------------------------------------------------------- union-find (lock-free)
@@ -1070,7 +1084,6 @@ fn run<R: ERec>(ctx: &Ctx, data: &Path, out: &Path, nt: usize, t0: Instant) {
     let est_events = (event_bytes / 75).max(1000);
     let pbits = std::env::var("PBITS").ok().and_then(|v| v.parse().ok()).unwrap_or(((est_events / 48_000).max(16).next_power_of_two().trailing_zeros()).min(10));
     let np_parts = 1usize << pbits;
-    let pshift = 64 - pbits;
 
     let mut slots = (total_bytes / 600).max(1 << 16) as usize * 3 / 2;
     let n_link_chunks = chunks.iter().filter(|c| files[c.file].kind == Kind::Links).count();
@@ -1084,7 +1097,6 @@ fn run<R: ERec>(ctx: &Ctx, data: &Path, out: &Path, nt: usize, t0: Instant) {
                 ev: PartBuf::new(&pool1, np_parts),
                 clicks: Vec::with_capacity((click_bytes / 45 / nt as u64) as usize * 5 / 4 + 1024),
                 links: Vec::new(),
-                lines: [0; 3],
             }
         };
         let parse = |range: std::ops::Range<usize>, with_buffers: bool| -> Vec<T1Out<R>> {
@@ -1096,14 +1108,14 @@ fn run<R: ERec>(ctx: &Ctx, data: &Path, out: &Path, nt: usize, t0: Instant) {
                             let mut o = if with_buffers {
                                 new_out()
                             } else {
-                                T1Out::<R> { ev: PartBuf::new(&pool1, 1), clicks: Vec::new(), links: Vec::new(), lines: [0; 3] }
+                                T1Out::<R> { ev: PartBuf::new(&pool1, 1), clicks: Vec::new(), links: Vec::new() }
                             };
                             let mut p = Parser {
                                 ctx,
                                 table: &table,
                                 alloc: IdAlloc::new(),
                                 cache: UserCache::new(),
-                                pshift,
+                                pbits,
                                 tsp: TsParser::new(),
                                 evb: [PendEv::default(); BATCH],
                                 nev: 0,
@@ -1128,44 +1140,51 @@ fn run<R: ERec>(ctx: &Ctx, data: &Path, out: &Path, nt: usize, t0: Instant) {
             })
         };
         // links first: every person's ids are joined before any event is read
-        let tl = parse(0..n_link_chunks, false);
-        if table.overflow.load(Ordering::Relaxed) {
-            slots *= 4;
-            continue 'attempt;
-        }
-        log!("links parsed: {:.3}s", t0.elapsed().as_secs_f64());
-        let n_ids = table.id_limit();
-        let parent: Vec<AtomicU32> = (0..n_ids as u32).map(AtomicU32::new).collect();
-        let edges: Vec<&[(u32, u32)]> = tl.iter().map(|o| o.links.as_slice()).collect();
-        let n_edges: usize = edges.iter().map(|e| e.len()).sum();
-        par_ranges(edges.len(), nt.min(edges.len()).max(1), |_, r| {
-            for e in &edges[r] {
-                for &(a, b) in e.iter() {
-                    uf_unite(&parent, a, b);
-                }
+        let (tl, n_edges) = if n_link_chunks > 0 {
+            let tl = parse(0..n_link_chunks, false);
+            if table.overflow.load(Ordering::Relaxed) {
+                slots *= 4;
+                continue 'attempt;
             }
-        });
-        log!("links united: {:.3}s", t0.elapsed().as_secs_f64());
-        let names = table.names();
-        let minname: Vec<AtomicU64> = (0..n_ids).map(|_| AtomicU64::new(0)).collect();
-        par_ranges(n_ids, nt, |_, r| {
-            for x in r {
-                if names[x] != 0 && parent[x].load(Ordering::Relaxed) != x as u32 {
-                    let root = uf_find(&parent, x as u32);
-                    atomic_min_key(&minname[root as usize], names[x]);
-                    table.redirect(names[x], root);
-                }
+            log!("links parsed: {:.3}s", t0.elapsed().as_secs_f64());
+            let edges: Vec<&[(u32, u32)]> = tl.iter().map(|o| o.links.as_slice()).collect();
+            let n_edges: usize = edges.iter().map(|e| e.len()).sum();
+            if n_edges > 0 {
+                let n_ids = table.id_limit();
+                let parent: Vec<AtomicU32> = (0..n_ids as u32).map(AtomicU32::new).collect();
+                par_ranges(edges.len(), nt.min(edges.len()).max(1), |_, r| {
+                    for e in &edges[r] {
+                        for &(a, b) in e.iter() {
+                            uf_unite(&parent, a, b);
+                        }
+                    }
+                });
+                log!("links united: {:.3}s", t0.elapsed().as_secs_f64());
+                let names = table.names();
+                let minname: Vec<AtomicU64> = (0..n_ids).map(|_| AtomicU64::new(0)).collect();
+                par_ranges(n_ids, nt, |_, r| {
+                    for x in r {
+                        if names[x] != 0 && parent[x].load(Ordering::Relaxed) != x as u32 {
+                            let root = uf_find(&parent, x as u32);
+                            atomic_min_key(&minname[root as usize], names[x]);
+                            table.redirect(names[x], root);
+                        }
+                    }
+                });
+                par_ranges(n_ids, nt, |_, r| {
+                    for x in r {
+                        let m = minname[x].load(Ordering::Relaxed);
+                        if m != 0 && key_cmp(m, names[x]) == std::cmp::Ordering::Less {
+                            unsafe { table.set_name(x as u32, m) };
+                        }
+                    }
+                });
             }
-        });
-        par_ranges(n_ids, nt, |_, r| {
-            for x in r {
-                let m = minname[x].load(Ordering::Relaxed);
-                if m != 0 && key_cmp(m, names[x]) == std::cmp::Ordering::Less {
-                    unsafe { table.set_name(x as u32, m) };
-                }
-            }
-        });
-        log!("links: {:.3}s  edges {}  ids {}", t0.elapsed().as_secs_f64(), n_edges, n_ids);
+            (tl, n_edges)
+        } else {
+            (Vec::new(), 0)
+        };
+        log!("links: {:.3}s  edges {}  ids {}", t0.elapsed().as_secs_f64(), n_edges, table.id_limit());
         drop(tl);
         let t1 = parse(n_link_chunks..chunks.len(), true);
         if table.overflow.load(Ordering::Relaxed) {
@@ -1175,11 +1194,9 @@ fn run<R: ERec>(ctx: &Ctx, data: &Path, out: &Path, nt: usize, t0: Instant) {
         }
         break (t1, table);
     };
-    let lines: [u64; 3] = t1.iter().fold([0; 3], |a, o| [a[0] + o.lines[0], a[1] + o.lines[1], a[2] + o.lines[2]]);
     log!(
-        "stage1 parse: {:.3}s  lines links/events/clicks {:?}  users {}  parts {}",
+        "stage1 parse: {:.3}s  users {}  parts {}",
         t0.elapsed().as_secs_f64(),
-        lines,
         table.id_limit(),
         np_parts
     );
@@ -1237,7 +1254,9 @@ fn run<R: ERec>(ctx: &Ctx, data: &Path, out: &Path, nt: usize, t0: Instant) {
                             tab.clear();
                             tab.resize(cap, 0);
                             for i in 0..n {
-                                let k = recs[i].key();
+                                let r_i = unsafe { *recs.get_unchecked(i) };
+                                let k = r_i.key();
+                                let ing_i = r_i.ingest();
                                 let mut h = fib2(k, tbits);
                                 loop {
                                     let sl = unsafe { *tab.get_unchecked(h) };
@@ -1247,7 +1266,7 @@ fn run<R: ERec>(ctx: &Ctx, data: &Path, out: &Path, nt: usize, t0: Instant) {
                                     }
                                     let j = (sl - 1) as usize;
                                     if unsafe { recs.get_unchecked(j) }.key() == k {
-                                        if recs[i].ingest() < unsafe { recs.get_unchecked(j) }.ingest() {
+                                        if ing_i < unsafe { recs.get_unchecked(j) }.ingest() {
                                             unsafe { *tab.get_unchecked_mut(h) = i as u32 + 1; }
                                         }
                                         break;
@@ -1411,6 +1430,13 @@ fn run<R: ERec>(ctx: &Ctx, data: &Path, out: &Path, nt: usize, t0: Instant) {
                                     if es[1].ts > es[2].ts { es.swap(1, 2); }
                                     if es[0].ts > es[1].ts { es.swap(0, 1); }
                                 }
+                                4 => {
+                                    if es[0].ts > es[1].ts { es.swap(0, 1); }
+                                    if es[2].ts > es[3].ts { es.swap(2, 3); }
+                                    if es[0].ts > es[2].ts { es.swap(0, 2); }
+                                    if es[1].ts > es[3].ts { es.swap(1, 3); }
+                                    if es[1].ts > es[2].ts { es.swap(1, 2); }
+                                }
                                 _ => es.sort_unstable_by_key(|e| e.ts),
                             }
                             let (ca, cb) = (cc[l] as usize, cc[l + 1] as usize);
@@ -1528,10 +1554,14 @@ fn write_campaign_daily(ctx: &Ctx, path: &Path, cc: &[CampCnt]) {
     use parquet::{as_bytes, push_bytes, Column, Kind as K};
     let n_days = ctx.n_days;
     let n_camp = ctx.camp_ids.len();
-    let mut ib = Vec::new();
-    let mut chb = Vec::new();
-    let mut days = Vec::new();
-    let (mut s, mut p, mut r, mut a) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let cap = (n_camp + 1) * n_days;
+    let mut ib = Vec::with_capacity(cap * 16);
+    let mut chb = Vec::with_capacity(cap * 16);
+    let mut days = Vec::with_capacity(cap);
+    let mut s = Vec::with_capacity(cap);
+    let mut p = Vec::with_capacity(cap);
+    let mut r = Vec::with_capacity(cap);
+    let mut a = Vec::with_capacity(cap);
     for c in 0..=n_camp {
         for d in 0..n_days {
             let x = cc[c * n_days + d];

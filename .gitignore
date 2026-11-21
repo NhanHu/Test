@@ -1,1 +1,5 @@
 target/
+*.zip
+dev/
+out/
+test_cases/
