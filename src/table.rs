@@ -3,7 +3,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use crate::keys::mix;
+use crate::keys::fib;
 
 pub const BLOCK: u32 = 1024;
 
@@ -89,7 +89,7 @@ impl UserTable {
 
     #[inline(always)]
     pub fn hash(&self, key: u64) -> usize {
-        (mix(key) >> self.shift) as usize
+        fib(key, 64 - self.shift)
     }
 
     #[inline(always)]

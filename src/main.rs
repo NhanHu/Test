@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::Instant;
 
-use keys::{key_cmp, key_lookup_padded, key_of, key_of_padded, mix};
+use keys::{fib, fib2, key_cmp, key_lookup_padded, key_of, key_of_padded};
 use table::{IdAlloc, UserTable};
 use ts::{parse_ts, TsParser, DAY};
 
@@ -38,14 +38,15 @@ struct SmallMap {
     keys: Vec<u64>,
     vals: Vec<u32>,
     mask: usize,
+    bits: u32,
 }
 
 impl SmallMap {
     fn new(items: &[(u64, u32)]) -> Self {
         let cap = (items.len() * 2).next_power_of_two().max(16);
-        let mut m = SmallMap { keys: vec![0; cap], vals: vec![0; cap], mask: cap - 1 };
+        let mut m = SmallMap { keys: vec![0; cap], vals: vec![0; cap], mask: cap - 1, bits: cap.trailing_zeros() };
         for &(k, v) in items {
-            let mut h = mix(k) as usize & m.mask;
+            let mut h = fib(k, m.bits);
             while m.keys[h] != 0 && m.keys[h] != k {
                 h = (h + 1) & m.mask;
             }
@@ -56,7 +57,7 @@ impl SmallMap {
     }
     #[inline(always)]
     fn get(&self, k: u64) -> Option<u32> {
-        let mut h = mix(k) as usize & self.mask;
+        let mut h = fib(k, self.bits);
         loop {
             let kk = self.keys[h];
             if kk == k {
@@ -104,15 +105,15 @@ impl Ctx {
     }
 }
 
-fn read_small_csv(path: &Path) -> Vec<[Vec<u8>; 2]> {
-    let data = std::fs::read(path).unwrap_or_default();
+/// (first, second) field spans of every well-formed two-field data line.
+fn read_small_csv(data: &[u8]) -> Vec<((usize, usize), (usize, usize))> {
     let mut out = Vec::new();
-    csv::for_each_line(&data, |line| {
+    let base = data.as_ptr() as usize;
+    csv::for_each_line(data, |line| {
         if let Some(f) = csv::split_scalar::<2>(line) {
-            let a = line[f[0].0 as usize..f[0].1 as usize].to_vec();
-            let b = line[f[1].0 as usize..f[1].1 as usize].to_vec();
-            if !a.is_empty() {
-                out.push([a, b]);
+            let o = line.as_ptr() as usize - base;
+            if f[0].1 > f[0].0 {
+                out.push(((o + f[0].0 as usize, o + f[0].1 as usize), (o + f[1].0 as usize, o + f[1].1 as usize)));
             }
         }
     });
@@ -139,24 +140,30 @@ fn build_ctx(data: &Path) -> Ctx {
     let first_day = ws.div_euclid(DAY);
     let n_days = ((we - 1).div_euclid(DAY) - first_day + 1) as usize;
 
-    let prows = read_small_csv(&data.join("products.csv"));
-    let mut cats: Vec<Vec<u8>> = prows.iter().map(|r| r[1].clone()).collect();
-    cats.push(b"unknown".to_vec());
+    let pdata = std::fs::read(data.join("products.csv")).unwrap_or_default();
+    let prows = read_small_csv(&pdata);
+    // categories, numbered in byte order (with "unknown") so ties go to the smaller id
+    let mut cat_of: std::collections::HashMap<&[u8], u32> = std::collections::HashMap::new();
+    for &(_, (a, b)) in &prows {
+        cat_of.entry(&pdata[a..b]).or_insert(0);
+    }
+    cat_of.entry(b"unknown").or_insert(0);
+    let mut cats: Vec<Vec<u8>> = cat_of.keys().map(|c| c.to_vec()).collect();
     cats.sort();
-    cats.dedup();
-    let unknown_cat = cats.binary_search(&b"unknown".to_vec()).unwrap() as u32;
-    let pitems: Vec<(u64, u32)> = prows
-        .iter()
-        .map(|r| (key_of(&r[0]), cats.binary_search(&r[1]).unwrap() as u32))
-        .collect();
-    let crows = read_small_csv(&data.join("campaigns.csv"));
+    for (i, c) in cats.iter().enumerate() {
+        *cat_of.get_mut(c.as_slice()).unwrap() = i as u32;
+    }
+    let unknown_cat = cat_of[&b"unknown"[..]];
+    let pitems: Vec<(u64, u32)> = prows.iter().map(|&((a, b), (c, d))| (key_of(&pdata[a..b]), cat_of[&pdata[c..d]])).collect();
+    let cdata = std::fs::read(data.join("campaigns.csv")).unwrap_or_default();
+    let crows = read_small_csv(&cdata);
     let mut camp_ids = Vec::new();
     let mut camp_channels = Vec::new();
     let mut citems = Vec::new();
-    for r in &crows {
-        citems.push((key_of(&r[0]), camp_ids.len() as u32));
-        camp_ids.push(r[0].clone());
-        camp_channels.push(r[1].clone());
+    for &((a, b), (c, d)) in &crows {
+        citems.push((key_of(&cdata[a..b]), camp_ids.len() as u32));
+        camp_ids.push(cdata[a..b].to_vec());
+        camp_channels.push(cdata[c..d].to_vec());
     }
     Ctx {
         ws,
@@ -618,7 +625,7 @@ impl<'a> Parser<'a> {
         for i in 0..self.nev {
             let pe = self.evb[i];
             let user = if pe.valid { self.table.get_or_insert(pe.ukey, pe.uh, &mut self.alloc) } else { INVALID };
-            let p = (mix(pe.key) >> self.pshift) as usize;
+            let p = fib(pe.key, 64 - self.pshift);
             out.ev.push(p, R::make(pe.key, pe.ing, user, pe.ts, pe.price, pe.cat));
         }
         self.nev = 0;
@@ -1178,11 +1185,12 @@ fn run<R: ERec>(ctx: &Ctx, data: &Path, out: &Path, nt: usize, t0: Instant) {
                             let n = recs.len();
                             let cap = (n * 2).next_power_of_two().max(16);
                             let mask = cap - 1;
+                            let tbits = cap.trailing_zeros();
                             tab.clear();
                             tab.resize(cap, 0);
                             for i in 0..n {
                                 let k = recs[i].key();
-                                let mut h = mix(k) as usize & mask;
+                                let mut h = fib2(k, tbits);
                                 loop {
                                     let sl = tab[h];
                                     if sl == 0 {

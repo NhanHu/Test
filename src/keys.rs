@@ -172,6 +172,18 @@ pub fn key_cmp(a: u64, b: u64) -> Ordering {
     }
 }
 
+/// Fibonacci hashing: the top `bits` bits of k times an odd constant.
+#[inline(always)]
+pub fn fib(k: u64, bits: u32) -> usize {
+    (k.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - bits)) as usize
+}
+
+/// A second, independent Fibonacci hash.
+#[inline(always)]
+pub fn fib2(k: u64, bits: u32) -> usize {
+    (k.wrapping_mul(0xD6E8_FEB8_6659_FD93) >> (64 - bits)) as usize
+}
+
 #[inline(always)]
 pub fn mix(mut x: u64) -> u64 {
     x ^= x >> 30;
