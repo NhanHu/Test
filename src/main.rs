@@ -326,12 +326,14 @@ struct Cl {
 mod sys {
     extern "C" {
         pub fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+        pub fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
     }
     pub const PROT_READ: i32 = 1;
     pub const MAP_PRIVATE: i32 = 2;
     pub const MAP_FIXED: i32 = 0x10;
     pub const MAP_ANONYMOUS: i32 = 0x20;
     pub const MAP_NORESERVE: i32 = 0x4000;
+    pub const MADV_SEQUENTIAL: i32 = 2;
 }
 
 fn huge_alloc(bytes: usize) -> (*mut u8, usize) {
@@ -486,6 +488,7 @@ impl InFile {
             assert!(reserve as isize != -1, "mmap reserve failed");
             let p = sys::mmap(reserve, size, sys::PROT_READ, sys::MAP_PRIVATE | sys::MAP_FIXED, file.as_raw_fd(), 0);
             assert!(p == reserve, "mmap file failed");
+            sys::madvise(p, size, sys::MADV_SEQUENTIAL);
             InFile { ptr: p, size, kind }
         }
     }
@@ -517,11 +520,24 @@ struct T1Out<'p, R: Copy> {
     lines: [u64; 3],
 }
 
+#[derive(Clone, Copy)]
+struct UserCache {
+    keys: [u64; 512],
+    ids: [u32; 512],
+}
+
+impl UserCache {
+    fn new() -> Self {
+        UserCache { keys: [0; 512], ids: [0; 512] }
+    }
+}
+
 #[derive(Clone, Copy, Default)]
 struct PendEv {
     key: u64,
     ukey: u64,
     uh: usize,
+    user: u32,
     ing: u32,
     ts: u32,
     price: u32,
@@ -534,6 +550,7 @@ struct PendCl {
     ckey: u64,
     ukey: u64,
     uh: usize,
+    user: u32,
     ts: u32,
     camp: u32,
 }
@@ -542,6 +559,7 @@ struct Parser<'a> {
     ctx: &'a Ctx,
     table: &'a UserTable,
     alloc: IdAlloc,
+    cache: UserCache,
     pshift: u32,
     tsp: TsParser,
     evb: [PendEv; BATCH],
@@ -608,11 +626,18 @@ impl<'a> Parser<'a> {
                 valid = false;
             }
         }
-        let mut pe = PendEv { key, ukey: 0, uh: 0, ing, ts, price, cat, valid };
+        let mut pe = PendEv { key, ukey: 0, uh: 0, user: INVALID, ing, ts, price, cat, valid };
         if valid {
-            pe.ukey = unsafe { key_of_padded(user_s) };
-            pe.uh = self.table.hash(pe.ukey);
-            self.table.prefetch(pe.uh);
+            let ukey = unsafe { key_of_padded(user_s) };
+            pe.ukey = ukey;
+            let idx = (ukey ^ (ukey >> 9)) as usize & 511;
+            if self.cache.keys[idx] == ukey {
+                pe.user = self.cache.ids[idx];
+            } else {
+                let uh = self.table.hash(ukey);
+                pe.uh = uh;
+                self.table.prefetch(uh);
+            }
         }
         self.evb[self.nev] = pe;
         self.nev += 1;
@@ -625,7 +650,19 @@ impl<'a> Parser<'a> {
     fn flush_events<R: ERec>(&mut self, out: &mut T1Out<R>) {
         for i in 0..self.nev {
             let pe = self.evb[i];
-            let user = if pe.valid { self.table.get_or_insert(pe.ukey, pe.uh, &mut self.alloc) } else { INVALID };
+            let user = if pe.valid {
+                if pe.user != INVALID {
+                    pe.user
+                } else {
+                    let id = self.table.get_or_insert(pe.ukey, pe.uh, &mut self.alloc);
+                    let idx = (pe.ukey ^ (pe.ukey >> 9)) as usize & 511;
+                    self.cache.keys[idx] = pe.ukey;
+                    self.cache.ids[idx] = id;
+                    id
+                }
+            } else {
+                INVALID
+            };
             let p = fib(pe.key, 64 - self.pshift);
             out.ev.push(p, R::make(pe.key, pe.ing, user, pe.ts, pe.price, pe.cat));
         }
@@ -650,9 +687,15 @@ impl<'a> Parser<'a> {
             None => return,
         };
         let ukey = unsafe { key_of_padded(user_s) };
-        let uh = self.table.hash(ukey);
-        self.table.prefetch(uh);
-        self.clb[self.ncl] = PendCl { ckey: unsafe { key_of_padded(cid) }, ukey, uh, ts: (t - ctx.base) as u32, camp };
+        let idx = (ukey ^ (ukey >> 9)) as usize & 511;
+        let (user, uh) = if self.cache.keys[idx] == ukey {
+            (self.cache.ids[idx], 0)
+        } else {
+            let uh = self.table.hash(ukey);
+            self.table.prefetch(uh);
+            (INVALID, uh)
+        };
+        self.clb[self.ncl] = PendCl { ckey: unsafe { key_of_padded(cid) }, ukey, uh, user, ts: (t - ctx.base) as u32, camp };
         self.ncl += 1;
         if self.ncl == BATCH {
             self.flush_clicks(out);
@@ -663,7 +706,15 @@ impl<'a> Parser<'a> {
     fn flush_clicks<R: Copy>(&mut self, out: &mut T1Out<R>) {
         for i in 0..self.ncl {
             let pc = self.clb[i];
-            let user = self.table.get_or_insert(pc.ukey, pc.uh, &mut self.alloc);
+            let user = if pc.user != INVALID {
+                pc.user
+            } else {
+                let id = self.table.get_or_insert(pc.ukey, pc.uh, &mut self.alloc);
+                let idx = (pc.ukey ^ (pc.ukey >> 9)) as usize & 511;
+                self.cache.keys[idx] = pc.ukey;
+                self.cache.ids[idx] = id;
+                id
+            };
             out.clicks.push(CRec { ckey: pc.ckey, user, ts: pc.ts, camp: pc.camp, _p: 0 });
         }
         self.ncl = 0;
@@ -936,16 +987,9 @@ fn process_person(ctx: &Ctx, st: &mut T3State, person: u32, evs: &[Ev], cls: &[C
             lo += 1;
         }
         let camp = if hi > lo {
-            let t = cls[hi - 1].ts;
-            let mut best = hi - 1;
-            let mut k = hi - 1;
-            while k > lo && cls[k - 1].ts == t {
-                k -= 1;
-                if key_cmp(cls[k].ckey, cls[best].ckey) == std::cmp::Ordering::Less {
-                    best = k;
-                }
-            }
-            cls[best].camp
+            // Clicks are sorted (ts ASC, ckey DESC), so cls[hi-1] is the click
+            // with the latest ts and, among ties, the smallest click_id.
+            cls[hi - 1].camp
         } else {
             organic
         };
@@ -1058,6 +1102,7 @@ fn run<R: ERec>(ctx: &Ctx, data: &Path, out: &Path, nt: usize, t0: Instant) {
                                 ctx,
                                 table: &table,
                                 alloc: IdAlloc::new(),
+                                cache: UserCache::new(),
                                 pshift,
                                 tsp: TsParser::new(),
                                 evb: [PendEv::default(); BATCH],
@@ -1195,15 +1240,15 @@ fn run<R: ERec>(ctx: &Ctx, data: &Path, out: &Path, nt: usize, t0: Instant) {
                                 let k = recs[i].key();
                                 let mut h = fib2(k, tbits);
                                 loop {
-                                    let sl = tab[h];
+                                    let sl = unsafe { *tab.get_unchecked(h) };
                                     if sl == 0 {
-                                        tab[h] = i as u32 + 1;
+                                        unsafe { *tab.get_unchecked_mut(h) = i as u32 + 1; }
                                         break;
                                     }
                                     let j = (sl - 1) as usize;
-                                    if recs[j].key() == k {
-                                        if recs[i].ingest() < recs[j].ingest() {
-                                            tab[h] = i as u32 + 1;
+                                    if unsafe { recs.get_unchecked(j) }.key() == k {
+                                        if recs[i].ingest() < unsafe { recs.get_unchecked(j) }.ingest() {
+                                            unsafe { *tab.get_unchecked_mut(h) = i as u32 + 1; }
                                         }
                                         break;
                                     }
@@ -1214,7 +1259,7 @@ fn run<R: ERec>(ctx: &Ctx, data: &Path, out: &Path, nt: usize, t0: Instant) {
                                 if sl == 0 {
                                     continue;
                                 }
-                                let r = &recs[(sl - 1) as usize];
+                                let r = unsafe { recs.get_unchecked((sl - 1) as usize) };
                                 if r.user() == INVALID {
                                     continue;
                                 }
@@ -1354,16 +1399,46 @@ fn run<R: ERec>(ctx: &Ctx, data: &Path, out: &Path, nt: usize, t0: Instant) {
                                 continue;
                             }
                             let es = &mut evs[a..b];
-                            if es.len() > 1 {
-                                es.sort_unstable_by_key(|e| e.ts);
+                            match es.len() {
+                                0 | 1 => {}
+                                2 => {
+                                    if es[0].ts > es[1].ts {
+                                        es.swap(0, 1);
+                                    }
+                                }
+                                3 => {
+                                    if es[0].ts > es[1].ts { es.swap(0, 1); }
+                                    if es[1].ts > es[2].ts { es.swap(1, 2); }
+                                    if es[0].ts > es[1].ts { es.swap(0, 1); }
+                                }
+                                _ => es.sort_unstable_by_key(|e| e.ts),
                             }
                             let (ca, cb) = (cc[l] as usize, cc[l + 1] as usize);
                             let cs = &mut cls[ca..cb];
-                            if cs.len() > 1 {
-                                cs.sort_unstable_by_key(|c| c.ts);
+                            match cs.len() {
+                                0 | 1 => {}
+                                2 => {
+                                    let cmp = cs[0].ts.cmp(&cs[1].ts).then_with(|| key_cmp(cs[1].ckey, cs[0].ckey));
+                                    if cmp == std::cmp::Ordering::Greater {
+                                        cs.swap(0, 1);
+                                    }
+                                }
+                                _ => cs.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| key_cmp(b.ckey, a.ckey))),
                             }
+                            let cs_slice = if cs.len() > 1 {
+                                let mut w = 0;
+                                for r in 1..cs.len() {
+                                    if cs[r].ckey != cs[w].ckey {
+                                        w += 1;
+                                        cs[w] = cs[r];
+                                    }
+                                }
+                                &cs[..=w]
+                            } else {
+                                &*cs
+                            };
                             let person = (l * nq + q) as u32;
-                            process_person(ctx, &mut st, person, &evs[a..b], &cls[ca..cb], organic);
+                            process_person(ctx, &mut st, person, es, cs_slice, organic);
                         }
                         st.counts = counts;
                         st.ccounts = cc;
@@ -1405,6 +1480,8 @@ fn run<R: ERec>(ctx: &Ctx, data: &Path, out: &Path, nt: usize, t0: Instant) {
         write_campaign_daily(ctx, &cd.join("part-0000.parquet"), &cc);
     });
     log!("done: {:.3}s", t0.elapsed().as_secs_f64());
+    // Skip freeing gigabytes of heap memory — all outputs are flushed.
+    std::process::exit(0);
 }
 
 fn write_user_daily(ctx: &Ctx, path: &Path, rows: &[UserRow], names: &[u64]) {
@@ -1415,12 +1492,14 @@ fn write_user_daily(ctx: &Ctx, path: &Path, rows: &[UserRow], names: &[u64]) {
     let mut sess = Vec::with_capacity(n);
     let mut evs = Vec::with_capacity(n);
     let mut def = Vec::with_capacity(n);
-    let mut cbuf = Vec::new();
+    let mut cbuf = Vec::with_capacity(n * 8);
+    let mut rev = Vec::with_capacity(n);
     for r in rows {
         keys::push_plain(names[r.person as usize], &mut ubuf);
         days.push(r.day);
         sess.push(r.sessions as i32);
         evs.push(r.events as i32);
+        rev.push(r.revenue as i64);
         if r.top != INVALID {
             def.push(true);
             push_bytes(&mut cbuf, &ctx.cat_names[r.top as usize]);
@@ -1429,7 +1508,6 @@ fn write_user_daily(ctx: &Ctx, path: &Path, rows: &[UserRow], names: &[u64]) {
         }
     }
     // INT64 even when the values would fit INT32: a reader summing an INT32 column can overflow.
-    let rev: Vec<i64> = rows.iter().map(|r| r.revenue as i64).collect();
     let defb = parquet::encode_def(&def);
     parquet::write_file(
         path,
