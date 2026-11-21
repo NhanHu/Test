@@ -137,7 +137,7 @@ pub fn parse_ts(s: &[u8]) -> Option<i64> {
 
 /// A faster parser with a per-thread cache of calendar dates (the data hold few distinct dates).
 pub struct TsParser {
-    keys: Box<[u32; 1024]>,
+    keys: Box<[u64; 1024]>,
     days: Box<[i32; 1024]>,
 }
 
@@ -170,6 +170,30 @@ impl TsParser {
         parse_digits(s)
     }
 
+    #[cold]
+    #[inline(never)]
+    fn date_miss(&mut self, x: u64, d1: u32, d2: u32, key: u64, idx: usize) -> i32 {
+        let b = |i: u32| ((x >> (8 * i)) & 0xFF) as i64;
+        let year = b(0) * 1000 + b(1) * 100 + b(2) * 10 + b(3);
+        let mo = b(5) * 10 + b(6);
+        let d = (d1 * 10 + d2) as i64;
+        let dim = match mo {
+            2 => {
+                if is_leap(year) {
+                    29
+                } else {
+                    28
+                }
+            }
+            4 | 6 | 9 | 11 => 30,
+            _ => 31,
+        };
+        let v = if (1..=12).contains(&mo) && d >= 1 && d <= dim { days_from_civil(year, mo, d) as i32 } else { NO_DAY };
+        self.keys[idx] = key;
+        self.days[idx] = v;
+        v
+    }
+
     #[inline(always)]
     fn iso(&mut self, s: &[u8]) -> Option<i64> {
         const HI: u64 = 0x8080_8080_8080_8080;
@@ -189,41 +213,27 @@ impl TsParser {
         {
             return None;
         }
-        let b = |v: u64, i: u32| ((v >> (8 * i)) & 0xFF) as i64;
-        let year = b(x, 0) * 1000 + b(x, 1) * 100 + b(x, 2) * 10 + b(x, 3);
-        let mo = b(x, 5) * 10 + b(x, 6);
-        let d = (d1 * 10 + d2) as i64;
-        let key = (year * 10_000 + mo * 100 + d + 1) as u32;
-        let idx = (key.wrapping_mul(0x9E37_79B1) >> 22) as usize;
+        // validated digits sit in bytes 0-3, 5, 6 of x; bytes 4 and 7 are zero, so the
+        // day digits fit there and the result identifies the date exactly
+        let key = x | ((d1 as u64) << 32) | ((d2 as u64) << 56);
+        let idx = (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 54) as usize;
         let days = if self.keys[idx] == key {
             self.days[idx]
         } else {
-            let dim = match mo {
-                2 => {
-                    if is_leap(year) {
-                        29
-                    } else {
-                        28
-                    }
-                }
-                4 | 6 | 9 | 11 => 30,
-                _ => 31,
-            };
-            let v = if (1..=12).contains(&mo) && d >= 1 && d <= dim { days_from_civil(year, mo, d) as i32 } else { NO_DAY };
-            self.keys[idx] = key;
-            self.days[idx] = v;
-            v
+            self.date_miss(x, d1, d2, key, idx)
         };
         if days == NO_DAY {
             return None;
         }
-        let h = b(y, 0) * 10 + b(y, 1);
-        let mi = b(y, 3) * 10 + b(y, 4);
-        let se = b(y, 6) * 10 + b(y, 7);
+        // pairs of digits: byte 0 = hour, byte 3 = minute, byte 6 = second
+        let t2 = y.wrapping_mul(10).wrapping_add(y >> 8);
+        let h = (t2 & 0xFF) as i64;
+        let mi = ((t2 >> 24) & 0xFF) as i64;
+        let se = ((t2 >> 48) & 0xFF) as i64;
         if h > 23 || mi > 59 || se > 59 {
             return None;
         }
-        let mut ms = (((days as i64 * 24 + h) * 60 + mi) * 60 + se) * SECOND;
+        let mut ms = days as i64 * DAY + (h * 3600 + mi * 60 + se) * SECOND;
         if s.len() == 20 {
             if s[19] != b'Z' {
                 return None;
