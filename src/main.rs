@@ -366,12 +366,19 @@ impl Pool {
 /// Not a power of two, so the current blocks of different partitions do not alias in the caches.
 const BLOCK_BYTES: usize = (16 << 10) + 3 * 64;
 
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct PartHead<T> {
+    cur: *mut T,
+    fill: u32,
+    _pad: u32,
+}
+
 /// Per-partition append buffers made of blocks from a shared pool.
 struct PartBuf<'p, T: Copy> {
     pool: &'p Pool,
     per_block: u32,
-    cur: Vec<*mut T>,
-    fill: Vec<u32>,
+    heads: Vec<PartHead<T>>,
     blocks: Vec<Vec<*mut T>>,
     /// recycled blocks to use before asking the pool
     spare: Vec<*mut u8>,
@@ -386,8 +393,7 @@ impl<'p, T: Copy> PartBuf<'p, T> {
         PartBuf {
             pool,
             per_block,
-            cur: vec![std::ptr::null_mut(); n_parts],
-            fill: vec![per_block; n_parts],
+            heads: vec![PartHead { cur: std::ptr::null_mut(), fill: per_block, _pad: 0 }; n_parts],
             blocks: (0..n_parts).map(|_| Vec::new()).collect(),
             spare: Vec::new(),
         }
@@ -395,13 +401,13 @@ impl<'p, T: Copy> PartBuf<'p, T> {
     #[inline(always)]
     fn push(&mut self, p: usize, x: T) {
         unsafe {
-            let f = *self.fill.get_unchecked(p);
-            if f == self.per_block {
+            let h = self.heads.get_unchecked_mut(p);
+            if h.fill == self.per_block {
                 self.new_block(p);
             }
-            let f = *self.fill.get_unchecked(p);
-            self.cur.get_unchecked(p).add(f as usize).write(x);
-            *self.fill.get_unchecked_mut(p) = f + 1;
+            let h = self.heads.get_unchecked_mut(p);
+            h.cur.add(h.fill as usize).write(x);
+            h.fill += 1;
         }
     }
     #[cold]
@@ -412,14 +418,15 @@ impl<'p, T: Copy> PartBuf<'p, T> {
             None => self.pool.alloc(BLOCK_BYTES) as *mut T,
         };
         self.blocks[p].push(b);
-        self.cur[p] = b;
-        self.fill[p] = 0;
+        let h = unsafe { self.heads.get_unchecked_mut(p) };
+        h.cur = b;
+        h.fill = 0;
     }
     /// The partition's records, block by block.
     fn chunks(&self, p: usize) -> impl Iterator<Item = &[T]> + '_ {
         let nb = self.blocks[p].len();
         let per = self.per_block as usize;
-        let last = self.fill[p] as usize;
+        let last = self.heads[p].fill as usize;
         self.blocks[p]
             .iter()
             .enumerate()
@@ -434,7 +441,7 @@ impl<'p, T: Copy> PartBuf<'p, T> {
         if nb == 0 {
             0
         } else {
-            (nb - 1) * self.per_block as usize + self.fill[p] as usize
+            (nb - 1) * self.per_block as usize + self.heads[p].fill as usize
         }
     }
 }
@@ -547,13 +554,6 @@ struct Parser<'a> {
 
 impl<'a> Parser<'a> {
     #[inline(always)]
-    fn user(&mut self, s: &[u8]) -> u32 {
-        let k = unsafe { key_of_padded(s) };
-        let h = self.table.hash(k);
-        self.table.get_or_insert(k, h, &mut self.alloc)
-    }
-
-    #[inline(always)]
     fn event<R: ERec>(&mut self, line: &[u8], f: &csv::Spans<7>, out: &mut T1Out<R>) {
         let fld = |i: usize| unsafe { line.get_unchecked(f[i].0 as usize..f[i].1 as usize) };
         let eid = fld(0);
@@ -562,12 +562,13 @@ impl<'a> Parser<'a> {
         }
         let key = unsafe { key_of_padded(eid) };
         let ctx = self.ctx;
-        let ingest = unsafe { self.tsp.parse_padded(fld(3)) };
-        let mut valid = ingest.is_some();
-        let ing_ms = ingest.unwrap_or(i64::MAX);
-        let ing = match ingest {
-            Some(v) => (v.div_euclid(1000) - ctx.base_s).clamp(0, u32::MAX as i64 - 1) as u32,
-            None => u32::MAX,
+        let ing_opt = self.tsp.parse_f1_seconds(fld(3));
+        let (ing_ms, ing_s) = ing_opt.unwrap_or((i64::MAX, 0));
+        let mut valid = ing_opt.is_some();
+        let ing = if valid {
+            (ing_s - ctx.base_s).clamp(0, u32::MAX as i64 - 1) as u32
+        } else {
+            u32::MAX
         };
         let user_s = fld(1);
         let prod = fld(5);
@@ -830,6 +831,8 @@ struct T3State {
     cls: Vec<Cl>,
     counts: Vec<u32>,
     ccounts: Vec<u32>,
+    fill: Vec<u32>,
+    cfill: Vec<u32>,
 }
 
 struct DayAcc {
@@ -1021,7 +1024,7 @@ fn run<R: ERec>(ctx: &Ctx, data: &Path, out: &Path, nt: usize, t0: Instant) {
         }
     }
     let est_events = (event_bytes / 75).max(1000);
-    let pbits = std::env::var("PBITS").ok().and_then(|v| v.parse().ok()).unwrap_or(((est_events / 40_000).max(16).next_power_of_two().trailing_zeros()).min(12));
+    let pbits = std::env::var("PBITS").ok().and_then(|v| v.parse().ok()).unwrap_or(((est_events / 48_000).max(16).next_power_of_two().trailing_zeros()).min(10));
     let np_parts = 1usize << pbits;
     let pshift = 64 - pbits;
 
@@ -1268,6 +1271,8 @@ fn run<R: ERec>(ctx: &Ctx, data: &Path, out: &Path, nt: usize, t0: Instant) {
                         cls: Vec::new(),
                         counts: Vec::new(),
                         ccounts: Vec::new(),
+                        fill: Vec::new(),
+                        cfill: Vec::new(),
                     };
                     loop {
                         let it = next.fetch_add(1, Ordering::Relaxed);
@@ -1294,9 +1299,12 @@ fn run<R: ERec>(ctx: &Ctx, data: &Path, out: &Path, nt: usize, t0: Instant) {
                         }
                         let mut evs = std::mem::take(&mut st.evs);
                         evs.clear();
-                        evs.resize(n, Ev { ts: 0, price: 0, cat: 0 });
+                        evs.reserve(n);
+                        unsafe { evs.set_len(n); }
                         {
-                            let mut fill = counts.clone();
+                            st.fill.clear();
+                            st.fill.extend_from_slice(&counts);
+                            let fill = &mut st.fill;
                             for o in &t2 {
                                 for c in o.ev.chunks(q) {
                                     for r in c {
@@ -1324,9 +1332,12 @@ fn run<R: ERec>(ctx: &Ctx, data: &Path, out: &Path, nt: usize, t0: Instant) {
                         }
                         let mut cls = std::mem::take(&mut st.cls);
                         cls.clear();
-                        cls.resize(ncl, Cl { ts: 0, camp: 0, ckey: 0 });
+                        cls.reserve(ncl);
+                        unsafe { cls.set_len(ncl); }
                         {
-                            let mut fill = cc.clone();
+                            st.cfill.clear();
+                            st.cfill.extend_from_slice(&cc);
+                            let fill = &mut st.cfill;
                             for o in &t2 {
                                 for c in o.cl.chunks(q) {
                                     for r in c {

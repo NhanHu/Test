@@ -148,6 +148,7 @@ impl TsParser {
         TsParser { keys: Box::new([0; 1024]), days: Box::new([0; 1024]) }
     }
 
+    #[allow(dead_code)]
     #[inline(always)]
     pub fn parse(&mut self, s: &[u8]) -> Option<i64> {
         let n = s.len();
@@ -192,6 +193,50 @@ impl TsParser {
         self.keys[idx] = key;
         self.days[idx] = v;
         v
+    }
+
+    /// Parses F1 format (`YYYY-MM-DDTHH:MM:SSZ`) directly, returning (milliseconds, seconds).
+    #[inline(always)]
+    pub fn parse_f1_seconds(&mut self, s: &[u8]) -> Option<(i64, i64)> {
+        if s.len() != 20 || unsafe { *s.get_unchecked(19) } != b'Z' {
+            return None;
+        }
+        const HI: u64 = 0x8080_8080_8080_8080;
+        const ADD: u64 = 0x7676_7676_7676_7676;
+        let lo = u64::from_le_bytes(s[0..8].try_into().unwrap());
+        let x = lo ^ 0x2D30_302D_3030_3030;
+        let t = u64::from_le_bytes(s[11..19].try_into().unwrap());
+        let y = t ^ 0x3030_3A30_303A_3030;
+        let d1 = dig(s[8]);
+        let d2 = dig(s[9]);
+        if ((x | x.wrapping_add(ADD) | y | y.wrapping_add(ADD)) & HI) != 0
+            || (x & 0xFF00_00FF_0000_0000) != 0
+            || (y & 0x0000_FF00_00FF_0000) != 0
+            || d1 > 9
+            || d2 > 9
+            || s[10] != b'T'
+        {
+            return None;
+        }
+        let key = x | ((d1 as u64) << 32) | ((d2 as u64) << 56);
+        let idx = (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 54) as usize;
+        let days = if self.keys[idx] == key {
+            self.days[idx]
+        } else {
+            self.date_miss(x, d1, d2, key, idx)
+        };
+        if days == NO_DAY {
+            return None;
+        }
+        let t2 = y.wrapping_mul(10).wrapping_add(y >> 8);
+        let h = (t2 & 0xFF) as i64;
+        let mi = ((t2 >> 24) & 0xFF) as i64;
+        let se = ((t2 >> 48) & 0xFF) as i64;
+        if h > 23 || mi > 59 || se > 59 {
+            return None;
+        }
+        let secs = days as i64 * 86400 + (h * 3600 + mi * 60 + se);
+        Some((secs * SECOND, secs))
     }
 
     #[inline(always)]
@@ -260,6 +305,7 @@ impl TsParser {
 }
 
 /// Days since the epoch to (y, m, d).
+#[allow(dead_code)]
 pub fn civil_from_days(days: i64) -> (i64, i64, i64) {
     let z = days + 719_468;
     let era = z.div_euclid(146_097);

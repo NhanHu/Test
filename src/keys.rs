@@ -184,6 +184,7 @@ pub fn fib2(k: u64, bits: u32) -> usize {
     (k.wrapping_mul(0xD6E8_FEB8_6659_FD93) >> (64 - bits)) as usize
 }
 
+#[allow(dead_code)]
 #[inline(always)]
 pub fn mix(mut x: u64) -> u64 {
     x ^= x >> 30;
