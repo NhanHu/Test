@@ -102,6 +102,28 @@ fn parse_digits(s: &[u8]) -> Option<i64> {
     Some(v.min(i64::MAX as u64) as i64)
 }
 
+#[inline(always)]
+fn eight(x: u64) -> u64 {
+    // x holds 8 digit values, the most significant in the lowest byte
+    let x = (x.wrapping_mul(2561)) >> 8;
+    let x = ((x & 0x00FF_00FF_00FF_00FF).wrapping_mul(6_553_601)) >> 16;
+    ((x & 0x0000_FFFF_0000_FFFF).wrapping_mul(42_949_672_960_001)) >> 32
+}
+
+/// 1 to 16 ASCII digits at p (16 readable bytes) as a number.
+#[inline(always)]
+pub unsafe fn digits16(p: *const u8, n: usize) -> Option<i64> {
+    let lo = (p as *const u64).read_unaligned() as u128;
+    let hi = (p.add(8) as *const u64).read_unaligned() as u128;
+    let mask: u128 = if n >= 16 { !0 } else { (1u128 << (8 * n)) - 1 };
+    let d = ((lo | (hi << 64)) ^ 0x3030_3030_3030_3030_3030_3030_3030_3030) & mask;
+    if (d | d.wrapping_add(0x7676_7676_7676_7676_7676_7676_7676_7676 & mask)) & 0x8080_8080_8080_8080_8080_8080_8080_8080 != 0 {
+        return None;
+    }
+    let d = d << (8 * (16 - n));
+    Some((eight(d as u64) * 100_000_000 + eight((d >> 64) as u64)) as i64)
+}
+
 /// Milliseconds since the epoch, or None for a bad timestamp. Out-of-range F3
 /// values saturate (they are then outside every window).
 #[inline(always)]
@@ -131,6 +153,19 @@ impl TsParser {
         let n = s.len();
         if (n == 20 || n == 25) && s[4] == b'-' {
             return self.iso(s);
+        }
+        parse_digits(s)
+    }
+
+    /// `parse` for a string followed by at least 16 readable bytes.
+    #[inline(always)]
+    pub unsafe fn parse_padded(&mut self, s: &[u8]) -> Option<i64> {
+        let n = s.len();
+        if (n == 20 || n == 25) && s[4] == b'-' {
+            return self.iso(s);
+        }
+        if n >= 1 && n <= 16 {
+            return digits16(s.as_ptr(), n);
         }
         parse_digits(s)
     }
@@ -249,6 +284,22 @@ mod tests {
         assert_eq!(parse_ts(b"86400000"), Some(86_400_000));
         assert_eq!(parse_ts(b"179102160000000000000"), Some(i64::MAX));
         assert_eq!(civil_from_days(days_from_civil(2028, 2, 29)), (2028, 2, 29));
+    }
+    #[test]
+    fn digits() {
+        let mut x: u64 = 5;
+        for _ in 0..300_000 {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let n = 1 + (x >> 60) as usize % 16;
+            let mut b: Vec<u8> = (0..n).map(|i| b'0' + ((x >> (i * 3)) % 10) as u8).collect();
+            if (x >> 20) % 5 == 0 {
+                let i = ((x >> 23) as usize) % n;
+                b[i] = [b'a', b'/', b':', b' ', b'.', 0xD9, b'-'][((x >> 26) % 7) as usize];
+            }
+            let mut buf = b.clone();
+            buf.resize(n + 16, b'7');
+            assert_eq!(unsafe { digits16(buf.as_ptr(), n) }, parse_ts(&b), "{:?}", std::str::from_utf8(&b));
+        }
     }
     #[test]
     fn fast_matches_slow() {

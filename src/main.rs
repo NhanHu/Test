@@ -555,7 +555,7 @@ impl<'a> Parser<'a> {
         }
         let key = unsafe { key_of_padded(eid) };
         let ctx = self.ctx;
-        let ingest = self.tsp.parse(fld(3));
+        let ingest = unsafe { self.tsp.parse_padded(fld(3)) };
         let mut valid = ingest.is_some();
         let ing_ms = ingest.unwrap_or(i64::MAX);
         let ing = match ingest {
@@ -569,7 +569,7 @@ impl<'a> Parser<'a> {
         let mut price = 0u32;
         let mut cat = 0u32;
         if valid {
-            match self.tsp.parse(fld(2)) {
+            match unsafe { self.tsp.parse_padded(fld(2)) } {
                 Some(t) if t >= ctx.ws && t < ctx.we && ing_ms - t <= LATE => {
                     ts = (t - ctx.base) as u32;
                 }
@@ -633,7 +633,7 @@ impl<'a> Parser<'a> {
             return;
         }
         let ctx = self.ctx;
-        let t = match self.tsp.parse(fld(3)) {
+        let t = match unsafe { self.tsp.parse_padded(fld(3)) } {
             Some(t) if t >= ctx.base && t < ctx.we => t,
             _ => return,
         };
@@ -1014,7 +1014,7 @@ fn run<R: ERec>(ctx: &Ctx, data: &Path, out: &Path, nt: usize, t0: Instant) {
         }
     }
     let est_events = (event_bytes / 75).max(1000);
-    let pbits = ((est_events / 40_000).max(16).next_power_of_two().trailing_zeros()).min(12);
+    let pbits = std::env::var("PBITS").ok().and_then(|v| v.parse().ok()).unwrap_or(((est_events / 40_000).max(16).next_power_of_two().trailing_zeros()).min(12));
     let np_parts = 1usize << pbits;
     let pshift = 64 - pbits;
 
@@ -1397,13 +1397,11 @@ fn write_user_daily(ctx: &Ctx, path: &Path, rows: &[UserRow], names: &[u64]) {
     let mut evs = Vec::with_capacity(n);
     let mut def = Vec::with_capacity(n);
     let mut cbuf = Vec::new();
-    let mut max_rev = 0u64;
     for r in rows {
         keys::push_plain(names[r.person as usize], &mut ubuf);
         days.push(r.day);
         sess.push(r.sessions as i32);
         evs.push(r.events as i32);
-        max_rev = max_rev.max(r.revenue);
         if r.top != INVALID {
             def.push(true);
             push_bytes(&mut cbuf, &ctx.cat_names[r.top as usize]);
@@ -1411,15 +1409,8 @@ fn write_user_daily(ctx: &Ctx, path: &Path, rows: &[UserRow], names: &[u64]) {
             def.push(false);
         }
     }
-    let rev32: Vec<i32>;
-    let rev64: Vec<i64>;
-    let (rev_kind, rev_bytes) = if max_rev <= i32::MAX as u64 {
-        rev32 = rows.iter().map(|r| r.revenue as i32).collect();
-        (K::Int32, as_bytes(&rev32))
-    } else {
-        rev64 = rows.iter().map(|r| r.revenue as i64).collect();
-        (K::Int64, as_bytes(&rev64))
-    };
+    // INT64 even when the values would fit INT32: a reader summing an INT32 column can overflow.
+    let rev: Vec<i64> = rows.iter().map(|r| r.revenue as i64).collect();
     let defb = parquet::encode_def(&def);
     parquet::write_file(
         path,
@@ -1429,7 +1420,7 @@ fn write_user_daily(ctx: &Ctx, path: &Path, rows: &[UserRow], names: &[u64]) {
             Column { name: "day", kind: K::Date, optional: false, parts: vec![as_bytes(&days)] },
             Column { name: "sessions", kind: K::Int32, optional: false, parts: vec![as_bytes(&sess)] },
             Column { name: "events", kind: K::Int32, optional: false, parts: vec![as_bytes(&evs)] },
-            Column { name: "revenue_cents", kind: rev_kind, optional: false, parts: vec![rev_bytes] },
+            Column { name: "revenue_cents", kind: K::Int64, optional: false, parts: vec![as_bytes(&rev)] },
             Column { name: "top_category", kind: K::Utf8, optional: true, parts: vec![&defb, &cbuf] },
         ],
     )
