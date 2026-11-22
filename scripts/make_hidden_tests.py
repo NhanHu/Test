@@ -273,6 +273,22 @@ def build_all_hidden_tests():
         links=[]
     )
 
+    # H16: 32-character hex suffixes on IDs (shopping-sessions-5 format)
+    write_case(
+        "H16_32char_hex_suffixes",
+        base_manifest, base_prods, base_camps,
+        events=[
+            ("e1_0123456789abcdef0123456789abcdef", "u1_abcdef0123456789abcdef0123456789", "2026-10-03T10:00:00Z", "2026-10-03T10:01:00Z", "view", "p1", ""),
+            ("e2_0123456789abcdef0123456789abcdef", "u2_11223344556677889900aabbccddeeff", "2026-10-03T10:15:00Z", "2026-10-03T10:16:00Z", "purchase", "p2", "8888"),
+        ],
+        clicks=[
+            ("k1_aabbccddeeff00112233445566778899", "u1_abcdef0123456789abcdef0123456789", "c_1", "2026-10-03T09:00:00Z")
+        ],
+        links=[
+            ("u2_11223344556677889900aabbccddeeff", "u1_abcdef0123456789abcdef0123456789")
+        ]
+    )
+
     cases = sorted(os.listdir(TEST_ROOT))
     print(f"Generated and verified {len(cases)} hidden test cases successfully!")
 

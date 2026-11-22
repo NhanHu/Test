@@ -8,8 +8,8 @@
 //! string and is never stored.
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock, RwLock};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomOrd};
+use std::sync::OnceLock;
 
 pub const LONG_BIT: u64 = 1 << 63;
 const MAX_COMPACT: usize = 9;
@@ -54,28 +54,171 @@ pub fn compact(s: &[u8]) -> Option<u64> {
     unsafe { compact_at(buf.as_ptr(), s.len()) }
 }
 
-struct Interner {
-    map: Mutex<HashMap<Vec<u8>, u64>>,
-    strings: RwLock<Vec<Vec<u8>>>,
-}
-
-fn interner() -> &'static Interner {
-    static I: OnceLock<Interner> = OnceLock::new();
-    I.get_or_init(|| Interner { map: Mutex::new(HashMap::new()), strings: RwLock::new(Vec::new()) })
-}
-
-#[cold]
-fn intern(s: &[u8]) -> u64 {
-    let i = interner();
-    let mut map = i.map.lock().unwrap();
-    if let Some(&k) = map.get(s) {
-        return k;
+#[inline(always)]
+pub fn rapidhash(s: &[u8]) -> u64 {
+    let len = s.len() as u64;
+    let mut seed = len ^ 0x2d358dccaa6c78a5;
+    let p = s.as_ptr();
+    let mut i = 0usize;
+    while i + 16 <= s.len() {
+        unsafe {
+            let u = (p.add(i) as *const u64).read_unaligned();
+            let v = (p.add(i + 8) as *const u64).read_unaligned();
+            seed = seed.wrapping_add(u).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            seed = (seed ^ (seed >> 32)).wrapping_mul(0xbf58476d1ce4e5b9);
+            seed = seed.wrapping_add(v).wrapping_mul(0xD6E8_FEB8_6659_FD93);
+        }
+        i += 16;
     }
-    let mut strings = i.strings.write().unwrap();
-    let k = LONG_BIT | strings.len() as u64;
-    strings.push(s.to_vec());
-    map.insert(s.to_vec(), k);
-    k
+    if i < s.len() {
+        let rem = s.len() - i;
+        let mut tail = 0u64;
+        unsafe {
+            std::ptr::copy_nonoverlapping(p.add(i), &mut tail as *mut u64 as *mut u8, rem.min(8));
+        }
+        seed = seed.wrapping_add(tail).wrapping_mul(0x94d049bb133111eb);
+        if rem > 8 {
+            let mut tail2 = 0u64;
+            unsafe {
+                std::ptr::copy_nonoverlapping(p.add(i + 8), &mut tail2 as *mut u64 as *mut u8, rem - 8);
+            }
+            seed = seed.wrapping_add(tail2).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+    }
+    seed ^= seed >> 32;
+    seed = seed.wrapping_mul(0xbf58476d1ce4e5b9);
+    seed ^ (seed >> 32)
+}
+
+#[inline(always)]
+pub unsafe fn hash_eid(s: &[u8]) -> u64 {
+    if let Some(k) = compact_at(s.as_ptr(), s.len()) {
+        k
+    } else {
+        rapidhash(s)
+    }
+}
+
+#[repr(C, align(16))]
+struct Slot {
+    state: AtomicU64,
+    ptr: *const u8,
+    len: u32,
+    idx: u32,
+}
+
+pub struct Interner {
+    slots: *mut Slot,
+    strings: *mut (*const u8, u32),
+    arena: *mut u8,
+    arena_off: AtomicUsize,
+    n_strings: AtomicUsize,
+    cap: usize,
+    bits: u32,
+}
+
+unsafe impl Sync for Interner {}
+unsafe impl Send for Interner {}
+
+impl Interner {
+    fn new() -> Self {
+        const CAP: usize = 1 << 22; // 4,194,304 slots
+        const BITS: u32 = 22;
+        const ARENA_SIZE: usize = 128 << 20; // 128 MB arena
+        Interner {
+            slots: crate::table::zeroed_bytes(CAP * std::mem::size_of::<Slot>()) as *mut Slot,
+            strings: crate::table::zeroed_bytes(CAP * 16) as *mut (*const u8, u32),
+            arena: crate::table::zeroed_bytes(ARENA_SIZE),
+            arena_off: AtomicUsize::new(0),
+            n_strings: AtomicUsize::new(0),
+            cap: CAP,
+            bits: BITS,
+        }
+    }
+
+    #[inline(always)]
+    pub fn intern(&self, s: &[u8]) -> u64 {
+        let h = rapidhash(s);
+        let tag = (h | 0x8000_0000_0000_0000) ^ 1;
+        let mask = self.cap - 1;
+        let mut i = (h.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - self.bits)) as usize;
+        loop {
+            let slot = unsafe { &*self.slots.add(i) };
+            let st = slot.state.load(AtomOrd::Acquire);
+            if st == tag {
+                let existing = unsafe { std::slice::from_raw_parts(slot.ptr, slot.len as usize) };
+                if existing == s {
+                    return LONG_BIT | (slot.idx as u64);
+                }
+                i = (i + 1) & mask;
+                continue;
+            }
+            if st == 0 {
+                if slot.state.compare_exchange(0, 1, AtomOrd::AcqRel, AtomOrd::Acquire).is_ok() {
+                    let len = s.len();
+                    let off = self.arena_off.fetch_add(len, AtomOrd::Relaxed);
+                    let dst = unsafe { self.arena.add(off) };
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(s.as_ptr(), dst, len);
+                    }
+                    let idx = self.n_strings.fetch_add(1, AtomOrd::Relaxed) as u32;
+                    unsafe {
+                        let sp = self.slots.add(i);
+                        (*sp).ptr = dst;
+                        (*sp).len = len as u32;
+                        (*sp).idx = idx;
+                        *self.strings.add(idx as usize) = (dst, len as u32);
+                    }
+                    slot.state.store(tag, AtomOrd::Release);
+                    return LONG_BIT | (idx as u64);
+                }
+                continue;
+            }
+            if st != 1 {
+                i = (i + 1) & mask;
+            } else {
+                std::hint::spin_loop();
+            }
+        }
+    }
+
+    #[inline(always)]
+    pub fn lookup(&self, s: &[u8]) -> Option<u64> {
+        let h = rapidhash(s);
+        let tag = (h | 0x8000_0000_0000_0000) ^ 1;
+        let mask = self.cap - 1;
+        let mut i = (h.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - self.bits)) as usize;
+        loop {
+            let slot = unsafe { &*self.slots.add(i) };
+            let st = slot.state.load(AtomOrd::Acquire);
+            if st == tag {
+                let existing = unsafe { std::slice::from_raw_parts(slot.ptr, slot.len as usize) };
+                if existing == s {
+                    return Some(LONG_BIT | (slot.idx as u64));
+                }
+            } else if st == 1 {
+                std::hint::spin_loop();
+                continue;
+            } else if st == 0 {
+                return None;
+            }
+            i = (i + 1) & mask;
+        }
+    }
+
+    #[inline(always)]
+    pub fn get(&self, k: u64) -> &[u8] {
+        let idx = (k & !LONG_BIT) as usize;
+        unsafe {
+            let (ptr, len) = *self.strings.add(idx);
+            std::slice::from_raw_parts(ptr, len as usize)
+        }
+    }
+}
+
+pub fn interner() -> &'static Interner {
+    static I: OnceLock<Interner> = OnceLock::new();
+    I.get_or_init(Interner::new)
 }
 
 /// Key of a non-empty string.
@@ -83,7 +226,7 @@ fn intern(s: &[u8]) -> u64 {
 pub fn key_of(s: &[u8]) -> u64 {
     match compact(s) {
         Some(k) => k,
-        None => intern(s),
+        None => interner().intern(s),
     }
 }
 
@@ -92,7 +235,7 @@ pub fn key_of(s: &[u8]) -> u64 {
 pub unsafe fn key_of_padded(s: &[u8]) -> u64 {
     match compact_at(s.as_ptr(), s.len()) {
         Some(k) => k,
-        None => intern(s),
+        None => interner().intern(s),
     }
 }
 
@@ -111,50 +254,33 @@ pub unsafe fn key_lookup_padded(s: &[u8]) -> Option<u64> {
 pub fn key_lookup(s: &[u8]) -> Option<u64> {
     match compact(s) {
         Some(k) => Some(k),
-        None => {
-            let i = interner();
-            let map = i.map.lock().unwrap();
-            map.get(s).copied()
-        }
+        None => interner().lookup(s),
     }
 }
 
 pub fn key_bytes_into(k: u64, out: &mut Vec<u8>) {
     if k & LONG_BIT != 0 {
-        let i = interner();
-        let strings = i.strings.read().unwrap();
-        out.extend_from_slice(&strings[(k & !LONG_BIT) as usize]);
+        out.extend_from_slice(interner().get(k));
     } else {
-        for j in 0..MAX_COMPACT {
-            let c = ((k >> (56 - 7 * j)) & 0x7F) as u8;
-            if c == 0 {
-                break;
-            }
-            out.push(c);
-        }
+        let mut buf = [0u8; 16];
+        let s = unpack_compact(k, &mut buf);
+        out.extend_from_slice(s);
     }
 }
 
 /// Appends the string of `k` as a PLAIN Parquet BYTE_ARRAY (length, bytes).
 #[inline(always)]
 pub fn push_plain(k: u64, out: &mut Vec<u8>) {
-    #[cfg(target_feature = "bmi2")]
     if k & LONG_BIT == 0 {
-        let b = unsafe { std::arch::x86_64::_pdep_u64(k >> 7, 0x7F7F_7F7F_7F7F_7F7F) }.swap_bytes();
-        let c9 = (k & 0x7F) as u8;
-        let z = b.wrapping_sub(0x0101_0101_0101_0101) & !b & 0x8080_8080_8080_8080;
-        let n8 = if z == 0 { 8 } else { (z.trailing_zeros() / 8) as usize };
-        let n = n8 + (n8 == 8 && c9 != 0) as usize;
-        out.extend_from_slice(&(n as u32).to_le_bytes());
-        out.extend_from_slice(&b.to_le_bytes()[..n8]);
-        if n == 9 {
-            out.push(c9);
-        }
-        return;
+        let mut buf = [0u8; 16];
+        let s = unpack_compact(k, &mut buf);
+        out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+        out.extend_from_slice(s);
+    } else {
+        let s = interner().get(k);
+        out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+        out.extend_from_slice(s);
     }
-    let v = key_bytes(k);
-    out.extend_from_slice(&(v.len() as u32).to_le_bytes());
-    out.extend_from_slice(&v);
 }
 
 pub fn key_bytes(k: u64) -> Vec<u8> {
@@ -163,12 +289,54 @@ pub fn key_bytes(k: u64) -> Vec<u8> {
     v
 }
 
+#[inline(always)]
+fn unpack_compact(k: u64, buf: &mut [u8; 16]) -> &[u8] {
+    #[cfg(target_feature = "bmi2")]
+    {
+        let b = unsafe { std::arch::x86_64::_pdep_u64(k >> 7, 0x7F7F_7F7F_7F7F_7F7F) }.swap_bytes();
+        let c9 = (k & 0x7F) as u8;
+        let z = b.wrapping_sub(0x0101_0101_0101_0101) & !b & 0x8080_8080_8080_8080;
+        let n8 = if z == 0 { 8 } else { (z.trailing_zeros() / 8) as usize };
+        let n = n8 + (n8 == 8 && c9 != 0) as usize;
+        buf[..8].copy_from_slice(&b.to_le_bytes());
+        if n == 9 {
+            buf[8] = c9;
+        }
+        &buf[..n]
+    }
+    #[cfg(not(target_feature = "bmi2"))]
+    {
+        let mut n = 0;
+        for j in 0..MAX_COMPACT {
+            let c = ((k >> (56 - 7 * j)) & 0x7F) as u8;
+            if c == 0 {
+                break;
+            }
+            buf[n] = c;
+            n += 1;
+        }
+        &buf[..n]
+    }
+}
+
 #[inline]
 pub fn key_cmp(a: u64, b: u64) -> Ordering {
     if (a | b) & LONG_BIT == 0 {
         a.cmp(&b)
     } else {
-        key_bytes(a).cmp(&key_bytes(b))
+        let mut bufa = [0u8; 16];
+        let mut bufb = [0u8; 16];
+        let sa = if a & LONG_BIT != 0 {
+            interner().get(a)
+        } else {
+            unpack_compact(a, &mut bufa)
+        };
+        let sb = if b & LONG_BIT != 0 {
+            interner().get(b)
+        } else {
+            unpack_compact(b, &mut bufb)
+        };
+        sa.cmp(sb)
     }
 }
 
@@ -204,6 +372,7 @@ mod tests {
             b"a", b"a-", b"a--", b"a0", b"A", b"Z", b"_", b"z", b"u1", b"U1", b"u10", b"u2", b"-", b"0", b"zzzzzzzzz",
             b"aaaaaaaaa", b"u1 ", b" u1", b"\tB", b"abcdefghij", b"e3\r", b"a\0b", b"\x7f", b"\x80", b"zzzzzzzz\x01",
             b"\x01", b"user_id_a", b"\xc3\xa9", b"ab\0",
+            b"u1_0123456789abcdef0123456789abcdef", b"u2_abcdef0123456789abcdef0123456789",
         ];
         for &x in &words {
             assert_eq!(key_bytes(key_of(x)), x.to_vec());

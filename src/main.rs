@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::Instant;
 
-use keys::{fib, fib2, key_cmp, key_lookup_padded, key_of, key_of_padded};
+use keys::{fib, fib2, hash_eid, key_cmp, key_lookup_padded, key_of, key_of_padded};
 use table::{IdAlloc, UserTable};
 use ts::{parse_ts, TsParser, DAY};
 
@@ -582,7 +582,7 @@ impl<'a> Parser<'a> {
         if eid.is_empty() {
             return;
         }
-        let key = unsafe { key_of_padded(eid) };
+        let key = unsafe { hash_eid(eid) };
         let ctx = self.ctx;
         let ing_opt = self.tsp.parse_f1_seconds(fld(3));
         let (ing_ms, ing_s) = ing_opt.unwrap_or((i64::MAX, 0));
