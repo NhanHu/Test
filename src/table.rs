@@ -125,7 +125,7 @@ impl UserTable {
             let slot = unsafe { &*self.slots.add(i) };
             let st = slot.state.load(Ordering::Acquire);
             if st >= 2 {
-                if unsafe { std::ptr::read_volatile(&slot.key) } == key {
+                if slot.key == key {
                     return st - 2;
                 }
                 i = (i + 1) & mask;
@@ -145,7 +145,7 @@ impl UserTable {
                 a.next += 1;
                 unsafe {
                     let sp = self.slots.add(i);
-                    std::ptr::write_volatile(&mut (*sp).key, key);
+                    (*sp).key = key;
                     if (id as usize) < self.max_ids {
                         *self.names.add(id as usize) = key;
                     }
@@ -179,7 +179,7 @@ impl UserTable {
         loop {
             let slot = unsafe { &*self.slots.add(i) };
             let st = slot.state.load(Ordering::Acquire);
-            if st >= 2 && unsafe { std::ptr::read_volatile(&slot.key) } == key {
+            if st >= 2 && slot.key == key {
                 slot.state.store(id + 2, Ordering::Release);
                 return;
             }

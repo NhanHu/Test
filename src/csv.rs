@@ -9,7 +9,7 @@ pub type Spans<const N: usize> = [(u32, u32); N];
 
 /// Bytes of readable zero padding that must follow the data in every buffer.
 #[allow(dead_code)]
-pub const PAD: usize = 192;
+pub const PAD: usize = 256;
 
 /// Scalar splitter for any line (no `\n` inside).
 pub fn split_scalar<const N: usize>(line: &[u8]) -> Option<Spans<N>> {
@@ -146,6 +146,60 @@ unsafe fn split_line_128<const N: usize>(
     (len, Some(out))
 }
 
+#[inline(always)]
+unsafe fn split_line_256<const N: usize>(
+    p: *const u8,
+    len: usize,
+    cm: [u64; 4],
+    qm: [u64; 4],
+) -> (usize, Option<Spans<N>>) {
+    if len > 256 || len == 0 {
+        let s = std::slice::from_raw_parts(p, len);
+        return (len, split_scalar::<N>(s));
+    }
+    let mut c = cm;
+    let mut q = qm;
+    let w_idx = len / 64;
+    let rem = len % 64;
+    if w_idx < 4 {
+        let mask = if rem == 0 { 0 } else { (1u64 << rem) - 1 };
+        c[w_idx] &= mask;
+        q[w_idx] &= mask;
+        for i in (w_idx + 1)..4 {
+            c[i] = 0;
+            q[i] = 0;
+        }
+    }
+    let total_commas = (c[0].count_ones() + c[1].count_ones() + c[2].count_ones() + c[3].count_ones()) as usize;
+    if total_commas != N - 1 {
+        return (len, None);
+    }
+    if (q[0] | q[1] | q[2] | q[3]) == 0 {
+        let mut commas = [0u32; 8];
+        let mut n_c = 0;
+        for w in 0..4 {
+            let mut cw = c[w];
+            let base = (w * 64) as u32;
+            while cw != 0 {
+                commas[n_c] = base + cw.trailing_zeros();
+                n_c += 1;
+                cw &= cw.wrapping_sub(1);
+            }
+        }
+        let mut out = [(0u32, 0u32); N];
+        let mut a = 0u32;
+        for i in 0..N - 1 {
+            let b = commas[i];
+            out[i] = (a, b);
+            a = b + 1;
+        }
+        out[N - 1] = (a, len as u32);
+        return (len, Some(out));
+    }
+    let s = std::slice::from_raw_parts(p, len);
+    (len, split_scalar::<N>(s))
+}
+
 /// Splits the line starting at `p`. `avail` is the number of data bytes from
 /// `p` to the end of the data (at least 1); `PAD` readable bytes follow the data.
 /// Returns (line length without the `\n`, fields if well-formed with N fields).
@@ -178,8 +232,34 @@ pub unsafe fn split_line<const N: usize>(p: *const u8, avail: usize) -> (usize, 
         if nl_hi != 0 {
             let len = 64 + nl_hi.trailing_zeros() as usize;
             return split_line_128::<N>(p, len, [cm0, cm1], [qm0, qm1]);
-        } else if avail < 128 {
+        }
+        if avail <= 128 {
             return split_line_128::<N>(p, avail, [cm0, cm1], [qm0, qm1]);
+        }
+        let v2 = _mm512_loadu_si512(p.add(128) as *const __m512i);
+        let nl2 = _mm512_cmpeq_epi8_mask(v2, nlv);
+        let cm2 = _mm512_cmpeq_epi8_mask(v2, cv);
+        let qm2 = _mm512_cmpeq_epi8_mask(v2, qv);
+        let lim2 = if avail >= 192 { !0u64 } else { (1u64 << (avail - 128)) - 1 };
+        let nl_2 = nl2 & lim2;
+        if nl_2 != 0 {
+            let len = 128 + nl_2.trailing_zeros() as usize;
+            return split_line_256::<N>(p, len, [cm0, cm1, cm2, 0], [qm0, qm1, qm2, 0]);
+        }
+        if avail <= 192 {
+            return split_line_256::<N>(p, avail, [cm0, cm1, cm2, 0], [qm0, qm1, qm2, 0]);
+        }
+        let v3 = _mm512_loadu_si512(p.add(192) as *const __m512i);
+        let nl3 = _mm512_cmpeq_epi8_mask(v3, nlv);
+        let cm3 = _mm512_cmpeq_epi8_mask(v3, cv);
+        let qm3 = _mm512_cmpeq_epi8_mask(v3, qv);
+        let lim3 = if avail >= 256 { !0u64 } else { (1u64 << (avail - 192)) - 1 };
+        let nl_3 = nl3 & lim3;
+        if nl_3 != 0 {
+            let len = 192 + nl_3.trailing_zeros() as usize;
+            return split_line_256::<N>(p, len, [cm0, cm1, cm2, cm3], [qm0, qm1, qm2, qm3]);
+        } else if avail < 256 {
+            return split_line_256::<N>(p, avail, [cm0, cm1, cm2, cm3], [qm0, qm1, qm2, qm3]);
         } else {
             let s = std::slice::from_raw_parts(p, avail);
             let len = s.iter().position(|&c| c == b'\n').unwrap_or(avail);
@@ -236,8 +316,56 @@ pub unsafe fn split_line<const N: usize>(p: *const u8, avail: usize) -> (usize, 
         if nl_hi != 0 {
             let len = 64 + nl_hi.trailing_zeros() as usize;
             return split_line_128::<N>(p, len, [cm0, cm1], [qm0, qm1]);
-        } else if avail < 128 {
+        }
+        if avail <= 128 {
             return split_line_128::<N>(p, avail, [cm0, cm1], [qm0, qm1]);
+        }
+
+        let v4 = _mm256_loadu_si256(p.add(128) as *const __m256i);
+        let m_nl4 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v4, nlv)) as u32 as u64;
+        let m_cm4 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v4, cv)) as u32 as u64;
+        let m_qm4 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v4, qv)) as u32 as u64;
+
+        let v5 = _mm256_loadu_si256(p.add(160) as *const __m256i);
+        let m_nl5 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v5, nlv)) as u32 as u64;
+        let m_cm5 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v5, cv)) as u32 as u64;
+        let m_qm5 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v5, qv)) as u32 as u64;
+
+        let nl2 = m_nl4 | (m_nl5 << 32);
+        let cm2 = m_cm4 | (m_cm5 << 32);
+        let qm2 = m_qm4 | (m_qm5 << 32);
+
+        let lim2 = if avail >= 192 { !0u64 } else { (1u64 << (avail - 128)) - 1 };
+        let nl_2 = nl2 & lim2;
+        if nl_2 != 0 {
+            let len = 128 + nl_2.trailing_zeros() as usize;
+            return split_line_256::<N>(p, len, [cm0, cm1, cm2, 0], [qm0, qm1, qm2, 0]);
+        }
+        if avail <= 192 {
+            return split_line_256::<N>(p, avail, [cm0, cm1, cm2, 0], [qm0, qm1, qm2, 0]);
+        }
+
+        let v6 = _mm256_loadu_si256(p.add(192) as *const __m256i);
+        let m_nl6 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v6, nlv)) as u32 as u64;
+        let m_cm6 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v6, cv)) as u32 as u64;
+        let m_qm6 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v6, qv)) as u32 as u64;
+
+        let v7 = _mm256_loadu_si256(p.add(224) as *const __m256i);
+        let m_nl7 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v7, nlv)) as u32 as u64;
+        let m_cm7 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v7, cv)) as u32 as u64;
+        let m_qm7 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v7, qv)) as u32 as u64;
+
+        let nl3 = m_nl6 | (m_nl7 << 32);
+        let cm3 = m_cm6 | (m_cm7 << 32);
+        let qm3 = m_qm6 | (m_qm7 << 32);
+
+        let lim3 = if avail >= 256 { !0u64 } else { (1u64 << (avail - 192)) - 1 };
+        let nl_3 = nl3 & lim3;
+        if nl_3 != 0 {
+            let len = 192 + nl_3.trailing_zeros() as usize;
+            return split_line_256::<N>(p, len, [cm0, cm1, cm2, cm3], [qm0, qm1, qm2, qm3]);
+        } else if avail < 256 {
+            return split_line_256::<N>(p, avail, [cm0, cm1, cm2, cm3], [qm0, qm1, qm2, qm3]);
         } else {
             let s = std::slice::from_raw_parts(p, avail);
             let len = s.iter().position(|&c| c == b'\n').unwrap_or(avail);

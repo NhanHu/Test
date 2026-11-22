@@ -141,14 +141,17 @@ impl Interner {
         let h = rapidhash(s);
         let tag = (h | 0x8000_0000_0000_0000) ^ 1;
         let mask = self.cap - 1;
-        let mut i = (h.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - self.bits)) as usize;
+        let mut i = (h as usize) & mask;
+        let slen = s.len() as u32;
         loop {
             let slot = unsafe { &*self.slots.add(i) };
             let st = slot.state.load(AtomOrd::Acquire);
             if st == tag {
-                let existing = unsafe { std::slice::from_raw_parts(slot.ptr, slot.len as usize) };
-                if existing == s {
-                    return LONG_BIT | (slot.idx as u64);
+                if slot.len == slen {
+                    let existing = unsafe { std::slice::from_raw_parts(slot.ptr, slen as usize) };
+                    if existing == s {
+                        return LONG_BIT | (slot.idx as u64);
+                    }
                 }
                 i = (i + 1) & mask;
                 continue;
@@ -165,9 +168,9 @@ impl Interner {
                     unsafe {
                         let sp = self.slots.add(i);
                         (*sp).ptr = dst;
-                        (*sp).len = len as u32;
+                        (*sp).len = slen;
                         (*sp).idx = idx;
-                        *self.strings.add(idx as usize) = (dst, len as u32);
+                        *self.strings.add(idx as usize) = (dst, slen);
                     }
                     slot.state.store(tag, AtomOrd::Release);
                     return LONG_BIT | (idx as u64);
@@ -187,14 +190,17 @@ impl Interner {
         let h = rapidhash(s);
         let tag = (h | 0x8000_0000_0000_0000) ^ 1;
         let mask = self.cap - 1;
-        let mut i = (h.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - self.bits)) as usize;
+        let mut i = (h as usize) & mask;
+        let slen = s.len() as u32;
         loop {
             let slot = unsafe { &*self.slots.add(i) };
             let st = slot.state.load(AtomOrd::Acquire);
             if st == tag {
-                let existing = unsafe { std::slice::from_raw_parts(slot.ptr, slot.len as usize) };
-                if existing == s {
-                    return Some(LONG_BIT | (slot.idx as u64));
+                if slot.len == slen {
+                    let existing = unsafe { std::slice::from_raw_parts(slot.ptr, slen as usize) };
+                    if existing == s {
+                        return Some(LONG_BIT | (slot.idx as u64));
+                    }
                 }
             } else if st == 1 {
                 std::hint::spin_loop();

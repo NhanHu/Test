@@ -524,15 +524,20 @@ struct T1Out<'p, R: Copy> {
     links: Vec<(u32, u32)>,
 }
 
-#[derive(Clone, Copy)]
+const USER_CACHE_SIZE: usize = 4096;
+const USER_CACHE_MASK: usize = USER_CACHE_SIZE - 1;
+
 struct UserCache {
-    keys: [u64; 1024],
-    ids: [u32; 1024],
+    keys: Box<[u64; USER_CACHE_SIZE]>,
+    ids: Box<[u32; USER_CACHE_SIZE]>,
 }
 
 impl UserCache {
     fn new() -> Self {
-        UserCache { keys: [0; 1024], ids: [0; 1024] }
+        UserCache {
+            keys: Box::new([0; USER_CACHE_SIZE]),
+            ids: Box::new([0; USER_CACHE_SIZE]),
+        }
     }
 }
 
@@ -647,7 +652,7 @@ impl<'a> Parser<'a> {
         if valid {
             let ukey = unsafe { key_of_padded(user_s) };
             pe.ukey = ukey;
-            let idx = (ukey ^ (ukey >> 10)) as usize & 1023;
+            let idx = (ukey ^ (ukey >> 12)) as usize & USER_CACHE_MASK;
             if self.cache.keys[idx] == ukey {
                 pe.user = self.cache.ids[idx];
             } else {
@@ -672,7 +677,7 @@ impl<'a> Parser<'a> {
                     pe.user
                 } else {
                     let id = self.table.get_or_insert(pe.ukey, pe.uh, &mut self.alloc);
-                    let idx = (pe.ukey ^ (pe.ukey >> 10)) as usize & 1023;
+                    let idx = (pe.ukey ^ (pe.ukey >> 12)) as usize & USER_CACHE_MASK;
                     self.cache.keys[idx] = pe.ukey;
                     self.cache.ids[idx] = id;
                     id
@@ -704,7 +709,7 @@ impl<'a> Parser<'a> {
             None => return,
         };
         let ukey = unsafe { key_of_padded(user_s) };
-        let idx = (ukey ^ (ukey >> 10)) as usize & 1023;
+        let idx = (ukey ^ (ukey >> 12)) as usize & USER_CACHE_MASK;
         let (user, uh) = if self.cache.keys[idx] == ukey {
             (self.cache.ids[idx], 0)
         } else {
@@ -727,7 +732,7 @@ impl<'a> Parser<'a> {
                 pc.user
             } else {
                 let id = self.table.get_or_insert(pc.ukey, pc.uh, &mut self.alloc);
-                let idx = (pc.ukey ^ (pc.ukey >> 10)) as usize & 1023;
+                let idx = (pc.ukey ^ (pc.ukey >> 12)) as usize & USER_CACHE_MASK;
                 self.cache.keys[idx] = pc.ukey;
                 self.cache.ids[idx] = id;
                 id
@@ -780,27 +785,44 @@ fn process_chunk<R: ERec>(p: &mut Parser, f: &InFile, ch: &Chunk, out: &mut T1Ou
         data[ch.s..].iter().position(|&c| c == b'\n').map_or(n, |q| ch.s + q + 1)
     };
     let ptr = f.ptr;
-    while i < ch.e {
-        let avail = n - i;
-        macro_rules! handle {
-            ($nf:literal, $method:ident) => {{
-                let (len, fields) = unsafe { csv::split_line::<$nf>(ptr.add(i), avail) };
+    match f.kind {
+        Kind::Events => {
+            while i < ch.e {
+                let avail = n - i;
+                let (len, fields) = unsafe { csv::split_line::<7>(ptr.add(i), avail) };
                 if let Some(fl) = fields {
                     let line = unsafe { std::slice::from_raw_parts(ptr.add(i), len) };
-                    p.$method(line, &fl, out);
+                    p.event(line, &fl, out);
                 }
                 i += len + 1;
-            }};
+            }
+            p.flush_events(out);
         }
-        match f.kind {
-            Kind::Events => handle!(7, event),
-            Kind::Clicks => handle!(4, click),
-            Kind::Links => handle!(2, link),
+        Kind::Clicks => {
+            while i < ch.e {
+                let avail = n - i;
+                let (len, fields) = unsafe { csv::split_line::<4>(ptr.add(i), avail) };
+                if let Some(fl) = fields {
+                    let line = unsafe { std::slice::from_raw_parts(ptr.add(i), len) };
+                    p.click(line, &fl, out);
+                }
+                i += len + 1;
+            }
+            p.flush_clicks(out);
+        }
+        Kind::Links => {
+            while i < ch.e {
+                let avail = n - i;
+                let (len, fields) = unsafe { csv::split_line::<2>(ptr.add(i), avail) };
+                if let Some(fl) = fields {
+                    let line = unsafe { std::slice::from_raw_parts(ptr.add(i), len) };
+                    p.link(line, &fl, out);
+                }
+                i += len + 1;
+            }
+            p.flush_links(out);
         }
     }
-    p.flush_events(out);
-    p.flush_clicks(out);
-    p.flush_links(out);
 }
 
 // ---------------------------------------------------------------- union-find (lock-free)
@@ -1042,6 +1064,8 @@ fn main() {
     let out = PathBuf::from(env_or("OUTPUT_DIR", "/output"));
     let args: Vec<String> = std::env::args().collect();
     let (data, out) = if args.len() >= 3 { (PathBuf::from(&args[1]), PathBuf::from(&args[2])) } else { (data, out) };
+    let _ = std::fs::create_dir_all(out.join("user_daily"));
+    let _ = std::fs::create_dir_all(out.join("campaign_daily"));
     let nt: usize = std::env::var("THREADS")
         .ok()
         .or_else(|| std::env::var("NCPU").ok())
@@ -1487,8 +1511,6 @@ fn run<R: ERec>(ctx: &Ctx, data: &Path, out: &Path, nt: usize, t0: Instant) {
     // ---- outputs
     let ud = out.join("user_daily");
     let cd = out.join("campaign_daily");
-    std::fs::create_dir_all(&ud).expect("mkdir user_daily");
-    std::fs::create_dir_all(&cd).expect("mkdir campaign_daily");
     thread::scope(|sc| {
         for (t, st) in t3.iter().enumerate() {
             let ud = &ud;
@@ -1513,7 +1535,7 @@ fn run<R: ERec>(ctx: &Ctx, data: &Path, out: &Path, nt: usize, t0: Instant) {
 fn write_user_daily(ctx: &Ctx, path: &Path, rows: &[UserRow], names: &[u64]) {
     use parquet::{as_bytes, push_bytes, Column, Kind as K};
     let n = rows.len();
-    let mut ubuf = Vec::with_capacity(n * 14);
+    let mut ubuf = Vec::with_capacity(n * 24);
     let mut days = Vec::with_capacity(n);
     let mut sess = Vec::with_capacity(n);
     let mut evs = Vec::with_capacity(n);
