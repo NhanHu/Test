@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::Instant;
 
-use keys::{fib, fib2, hash_eid, key_cmp, key_lookup_padded, key_of, key_of_padded};
+use keys::{compact_at, fib, fib2, hash_eid, interner, key_cmp, key_lookup_padded, key_of, key_of_padded, rapidhash, LONG_BIT};
 use table::{IdAlloc, UserTable};
 use ts::{parse_ts, TsParser, DAY};
 
@@ -541,12 +541,14 @@ impl UserCache {
     }
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 struct PendEv {
     key: u64,
     ukey: u64,
     uh: usize,
     user: u32,
+    uptr: *const u8,
+    ulen: u32,
     ing: u32,
     ts: u32,
     price: u32,
@@ -554,14 +556,76 @@ struct PendEv {
     valid: bool,
 }
 
-#[derive(Clone, Copy, Default)]
+impl Default for PendEv {
+    fn default() -> Self {
+        PendEv {
+            key: 0,
+            ukey: 0,
+            uh: 0,
+            user: INVALID,
+            uptr: std::ptr::null(),
+            ulen: 0,
+            ing: 0,
+            ts: 0,
+            price: 0,
+            cat: 0,
+            valid: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
 struct PendCl {
     ckey: u64,
     ukey: u64,
     uh: usize,
     user: u32,
+    uptr: *const u8,
+    ulen: u32,
     ts: u32,
     camp: u32,
+}
+
+impl Default for PendCl {
+    fn default() -> Self {
+        PendCl {
+            ckey: 0,
+            ukey: 0,
+            uh: 0,
+            user: INVALID,
+            uptr: std::ptr::null(),
+            ulen: 0,
+            ts: 0,
+            camp: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PendLk {
+    ka: u64,
+    kb: u64,
+    ha: usize,
+    hb: usize,
+    aptr: *const u8,
+    alen: u32,
+    bptr: *const u8,
+    blen: u32,
+}
+
+impl Default for PendLk {
+    fn default() -> Self {
+        PendLk {
+            ka: 0,
+            kb: 0,
+            ha: 0,
+            hb: 0,
+            aptr: std::ptr::null(),
+            alen: 0,
+            bptr: std::ptr::null(),
+            blen: 0,
+        }
+    }
 }
 
 struct Parser<'a> {
@@ -575,7 +639,7 @@ struct Parser<'a> {
     nev: usize,
     clb: [PendCl; BATCH],
     ncl: usize,
-    lkb: [(u64, u64, usize, usize); BATCH],
+    lkb: [PendLk; BATCH],
     nlk: usize,
 }
 
@@ -648,11 +712,30 @@ impl<'a> Parser<'a> {
                 valid = false;
             }
         }
-        let mut pe = PendEv { key, ukey: 0, uh: 0, user: INVALID, ing, ts, price, cat, valid };
+        let mut pe = PendEv {
+            key,
+            ukey: 0,
+            uh: 0,
+            user: INVALID,
+            uptr: std::ptr::null(),
+            ulen: 0,
+            ing,
+            ts,
+            price,
+            cat,
+            valid,
+        };
         if valid {
-            let ukey = unsafe { key_of_padded(user_s) };
+            let ukey = unsafe {
+                match compact_at(user_s.as_ptr(), user_s.len()) {
+                    Some(k) => k,
+                    None => rapidhash(user_s) | LONG_BIT,
+                }
+            };
             pe.ukey = ukey;
-            let idx = (ukey ^ (ukey >> 12)) as usize & USER_CACHE_MASK;
+            pe.uptr = user_s.as_ptr();
+            pe.ulen = user_s.len() as u32;
+            let idx = fib(ukey, 12);
             if self.cache.keys[idx] == ukey {
                 pe.user = self.cache.ids[idx];
             } else {
@@ -676,8 +759,14 @@ impl<'a> Parser<'a> {
                 if pe.user != INVALID {
                     pe.user
                 } else {
-                    let id = self.table.get_or_insert(pe.ukey, pe.uh, &mut self.alloc);
-                    let idx = (pe.ukey ^ (pe.ukey >> 12)) as usize & USER_CACHE_MASK;
+                    let id = self.table.get_or_insert(pe.ukey, pe.uh, &mut self.alloc, || {
+                        if pe.ukey & LONG_BIT == 0 {
+                            pe.ukey
+                        } else {
+                            interner().intern(unsafe { std::slice::from_raw_parts(pe.uptr, pe.ulen as usize) })
+                        }
+                    });
+                    let idx = fib(pe.ukey, 12);
                     self.cache.keys[idx] = pe.ukey;
                     self.cache.ids[idx] = id;
                     id
@@ -708,8 +797,13 @@ impl<'a> Parser<'a> {
             Some(c) => c,
             None => return,
         };
-        let ukey = unsafe { key_of_padded(user_s) };
-        let idx = (ukey ^ (ukey >> 12)) as usize & USER_CACHE_MASK;
+        let ukey = unsafe {
+            match compact_at(user_s.as_ptr(), user_s.len()) {
+                Some(k) => k,
+                None => rapidhash(user_s) | LONG_BIT,
+            }
+        };
+        let idx = fib(ukey, 12);
         let (user, uh) = if self.cache.keys[idx] == ukey {
             (self.cache.ids[idx], 0)
         } else {
@@ -717,7 +811,17 @@ impl<'a> Parser<'a> {
             self.table.prefetch(uh);
             (INVALID, uh)
         };
-        self.clb[self.ncl] = PendCl { ckey: unsafe { key_of_padded(cid) }, ukey, uh, user, ts: (t - ctx.base) as u32, camp };
+        let ckey = unsafe { key_of_padded(cid) };
+        self.clb[self.ncl] = PendCl {
+            ckey,
+            ukey,
+            uh,
+            user,
+            uptr: user_s.as_ptr(),
+            ulen: user_s.len() as u32,
+            ts: (t - ctx.base) as u32,
+            camp,
+        };
         self.ncl += 1;
         if self.ncl == BATCH {
             self.flush_clicks(out);
@@ -731,8 +835,14 @@ impl<'a> Parser<'a> {
             let user = if pc.user != INVALID {
                 pc.user
             } else {
-                let id = self.table.get_or_insert(pc.ukey, pc.uh, &mut self.alloc);
-                let idx = (pc.ukey ^ (pc.ukey >> 12)) as usize & USER_CACHE_MASK;
+                let id = self.table.get_or_insert(pc.ukey, pc.uh, &mut self.alloc, || {
+                    if pc.ukey & LONG_BIT == 0 {
+                        pc.ukey
+                    } else {
+                        interner().intern(unsafe { std::slice::from_raw_parts(pc.uptr, pc.ulen as usize) })
+                    }
+                });
+                let idx = fib(pc.ukey, 12);
                 self.cache.keys[idx] = pc.ukey;
                 self.cache.ids[idx] = id;
                 id
@@ -749,12 +859,31 @@ impl<'a> Parser<'a> {
         if a.is_empty() || b.is_empty() || a == b {
             return;
         }
-        let ka = unsafe { key_of_padded(a) };
-        let kb = unsafe { key_of_padded(b) };
+        let ka = unsafe {
+            match compact_at(a.as_ptr(), a.len()) {
+                Some(k) => k,
+                None => rapidhash(a) | LONG_BIT,
+            }
+        };
+        let kb = unsafe {
+            match compact_at(b.as_ptr(), b.len()) {
+                Some(k) => k,
+                None => rapidhash(b) | LONG_BIT,
+            }
+        };
         let (ha, hb) = (self.table.hash(ka), self.table.hash(kb));
         self.table.prefetch(ha);
         self.table.prefetch(hb);
-        self.lkb[self.nlk] = (ka, kb, ha, hb);
+        self.lkb[self.nlk] = PendLk {
+            ka,
+            kb,
+            ha,
+            hb,
+            aptr: a.as_ptr(),
+            alen: a.len() as u32,
+            bptr: b.as_ptr(),
+            blen: b.len() as u32,
+        };
         self.nlk += 1;
         if self.nlk == BATCH {
             self.flush_links(out);
@@ -764,9 +893,21 @@ impl<'a> Parser<'a> {
     #[inline(always)]
     fn flush_links<R: Copy>(&mut self, out: &mut T1Out<R>) {
         for i in 0..self.nlk {
-            let (ka, kb, ha, hb) = self.lkb[i];
-            let ia = self.table.get_or_insert(ka, ha, &mut self.alloc);
-            let ib = self.table.get_or_insert(kb, hb, &mut self.alloc);
+            let lk = self.lkb[i];
+            let ia = self.table.get_or_insert(lk.ka, lk.ha, &mut self.alloc, || {
+                if lk.ka & LONG_BIT == 0 {
+                    lk.ka
+                } else {
+                    interner().intern(unsafe { std::slice::from_raw_parts(lk.aptr, lk.alen as usize) })
+                }
+            });
+            let ib = self.table.get_or_insert(lk.kb, lk.hb, &mut self.alloc, || {
+                if lk.kb & LONG_BIT == 0 {
+                    lk.kb
+                } else {
+                    interner().intern(unsafe { std::slice::from_raw_parts(lk.bptr, lk.blen as usize) })
+                }
+            });
             out.links.push((ia, ib));
         }
         self.nlk = 0;
@@ -1109,7 +1250,7 @@ fn run<R: ERec>(ctx: &Ctx, data: &Path, out: &Path, nt: usize, t0: Instant) {
     let pbits = std::env::var("PBITS").ok().and_then(|v| v.parse().ok()).unwrap_or(((est_events / 48_000).max(16).next_power_of_two().trailing_zeros()).min(10));
     let np_parts = 1usize << pbits;
 
-    let mut slots = (total_bytes / 600).max(1 << 16) as usize * 3 / 2;
+    let mut slots = (total_bytes / 1200).max(1 << 17) as usize;
     let n_link_chunks = chunks.iter().filter(|c| files[c.file].kind == Kind::Links).count();
     let rec_bytes = std::mem::size_of::<R>();
     let pool1 = Pool::new(est_events as usize * rec_bytes * 5 / 4 + nt * np_parts * BLOCK_BYTES);
@@ -1145,7 +1286,7 @@ fn run<R: ERec>(ctx: &Ctx, data: &Path, out: &Path, nt: usize, t0: Instant) {
                                 nev: 0,
                                 clb: [PendCl::default(); BATCH],
                                 ncl: 0,
-                                lkb: [(0, 0, 0, 0); BATCH],
+                                lkb: [PendLk::default(); BATCH],
                                 nlk: 0,
                             };
                             loop {
@@ -1185,13 +1326,16 @@ fn run<R: ERec>(ctx: &Ctx, data: &Path, out: &Path, nt: usize, t0: Instant) {
                 });
                 log!("links united: {:.3}s", t0.elapsed().as_secs_f64());
                 let names = table.names();
+                let keys = table.keys();
                 let minname: Vec<AtomicU64> = (0..n_ids).map(|_| AtomicU64::new(0)).collect();
                 par_ranges(n_ids, nt, |_, r| {
                     for x in r {
-                        if names[x] != 0 && parent[x].load(Ordering::Relaxed) != x as u32 {
+                        if names[x] != 0 {
                             let root = uf_find(&parent, x as u32);
                             atomic_min_key(&minname[root as usize], names[x]);
-                            table.redirect(names[x], root);
+                            if root != x as u32 {
+                                table.redirect(keys[x], root);
+                            }
                         }
                     }
                 });

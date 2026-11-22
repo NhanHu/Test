@@ -20,6 +20,7 @@ pub struct UserTable {
     n_slots: usize,
     bits: u32,
     names: *mut u64,
+    keys: *mut u64,
     max_ids: usize,
     next_block: AtomicU32,
     max_blocks: u32,
@@ -80,6 +81,7 @@ impl UserTable {
             n_slots,
             bits: n_slots.trailing_zeros(),
             names: zeroed::<u64>(max_ids),
+            keys: zeroed::<u64>(max_ids),
             max_ids,
             next_block: AtomicU32::new(0),
             max_blocks,
@@ -118,7 +120,7 @@ impl UserTable {
 
     /// The id for `key` (non-zero), inserting it if new.
     #[inline(always)]
-    pub fn get_or_insert(&self, key: u64, h: usize, a: &mut IdAlloc) -> u32 {
+    pub fn get_or_insert(&self, key: u64, h: usize, a: &mut IdAlloc, name: impl FnOnce() -> u64) -> u32 {
         let mask = self.n_slots - 1;
         let mut i = h;
         loop {
@@ -143,11 +145,13 @@ impl UserTable {
                 }
                 let id = a.next;
                 a.next += 1;
+                let nm = name();
                 unsafe {
                     let sp = self.slots.add(i);
                     (*sp).key = key;
                     if (id as usize) < self.max_ids {
-                        *self.names.add(id as usize) = key;
+                        *self.names.add(id as usize) = nm;
+                        *self.keys.add(id as usize) = key;
                     }
                 }
                 slot.state.store(id + 2, Ordering::Release);
@@ -165,6 +169,11 @@ impl UserTable {
     /// names[id] = key for allocated ids, 0 for holes.
     pub fn names(&self) -> &[u64] {
         unsafe { std::slice::from_raw_parts(self.names, self.id_limit()) }
+    }
+
+    /// keys[id] = lookup key for allocated ids.
+    pub fn keys(&self) -> &[u64] {
+        unsafe { std::slice::from_raw_parts(self.keys, self.id_limit()) }
     }
 
     /// Overwrites names[id]; only between parsing passes.

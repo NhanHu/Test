@@ -122,9 +122,9 @@ unsafe impl Send for Interner {}
 
 impl Interner {
     fn new() -> Self {
-        const CAP: usize = 1 << 22; // 4,194,304 slots
-        const BITS: u32 = 22;
-        const ARENA_SIZE: usize = 128 << 20; // 128 MB arena
+        const CAP: usize = 1 << 18; // 262,144 slots
+        const BITS: u32 = 18;
+        const ARENA_SIZE: usize = 16 << 20; // 16 MB arena
         Interner {
             slots: crate::table::zeroed_bytes(CAP * std::mem::size_of::<Slot>()) as *mut Slot,
             strings: crate::table::zeroed_bytes(CAP * 16) as *mut (*const u8, u32),
